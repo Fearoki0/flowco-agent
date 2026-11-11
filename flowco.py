@@ -5047,6 +5047,25 @@ def run_selftest() -> int:
                 assert STREAM_STATE["usage"] is False
             test("Stream options quirk auto-healing", t_quirk_stream_options)
 
+            # Test 22: Prompt toolbar rendering
+            def t_prompt_toolbar():
+                session = get_prompt_session()
+                assert session is not None or not PROMPT_TOOLKIT_AVAILABLE
+                BACKGROUND_TASKS["bg_test"] = {"proc": None}
+                m_label = CFG.get("model", "-").split("/")[-1]
+                ws_label = WORK.name or "work"
+                total_tokens = USAGE["in"] + USAGE["out"]
+                budget = CFG.get("task_token_budget", 0)
+                tok_str = f"{total_tokens:,} tok"
+                bg_alive = len([t for t in BACKGROUND_TASKS.values() if t.get("proc") and t["proc"].poll() is None])
+                bg_str = f" │ ⚙ {bg_alive} bg" if bg_alive else ""
+                tb = HTML(
+                    f" <b>[{m_label}]</b> │ <b>📂 {ws_label}</b> │ {tok_str}{bg_str} │ <i>/: commands</i> │ <i>Tab/Enter: select</i> │ <i>Ctrl+C: cancel</i> "
+                )
+                assert tb is not None
+                del BACKGROUND_TASKS["bg_test"]
+            test("Prompt toolbar rendering & background task counts", t_prompt_toolbar)
+
         finally:
             WORK = old_work
             BACKUP_DIR = old_backup
@@ -5274,18 +5293,21 @@ def get_user_input() -> str:
     session = get_prompt_session()
     if session is not None and sys.stdin.isatty():
         def _toolbar():
-            m_label = CFG.get("model", "-").split("/")[-1]
-            ws_label = WORK.name or "work"
-            total_tokens = USAGE["in"] + USAGE["out"]
-            budget = CFG.get("task_token_budget", 0)
-            tok_str = f"{total_tokens:,} tok"
-            if budget:
-                tok_str += f"/{budget:,}"
-            bg_alive = len([t for t in BG_TASKS.values() if t.get("proc") and t["proc"].poll() is None])
-            bg_str = f" │ ⚙ {bg_alive} bg" if bg_alive else ""
-            return HTML(
-                f" <b>[{m_label}]</b> │ <b>📂 {ws_label}</b> │ {tok_str}{bg_str} │ <i>/: commands</i> │ <i>Tab/Enter: select</i> │ <i>Ctrl+C: cancel</i> "
-            )
+            try:
+                m_label = CFG.get("model", "-").split("/")[-1]
+                ws_label = WORK.name or "work"
+                total_tokens = USAGE["in"] + USAGE["out"]
+                budget = CFG.get("task_token_budget", 0)
+                tok_str = f"{total_tokens:,} tok"
+                if budget:
+                    tok_str += f"/{budget:,}"
+                bg_alive = len([t for t in BACKGROUND_TASKS.values() if t.get("proc") and t["proc"].poll() is None])
+                bg_str = f" │ ⚙ {bg_alive} bg" if bg_alive else ""
+                return HTML(
+                    f" <b>[{m_label}]</b> │ <b>📂 {ws_label}</b> │ {tok_str}{bg_str} │ <i>/: commands</i> │ <i>Tab/Enter: select</i> │ <i>Ctrl+C: cancel</i> "
+                )
+            except Exception:
+                return HTML(" <b>FlowCo</b> │ <i>/: commands</i> │ <i>Tab/Enter: select</i> ")
 
         def _prompt():
             m_label = CFG.get("model", "-").split("/")[-1]
