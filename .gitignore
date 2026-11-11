@@ -1,0 +1,12 @@
+# FlowCo gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.part
+.tmp/
+.cache/
+backups/
+downloads/
+github/
+*.log
