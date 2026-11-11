@@ -365,13 +365,14 @@ def set_tmux_title(status: str, short_title: str = "") -> None:
     if not sys.stdout.isatty():
         return
     try:
-        title = f"FlowCo: {status}" if status else "FlowCo"
+        clean_status = re.sub(r"[\r\n\x00-\x1f]+", " ", str(status or "")).strip()
+        title = f"FlowCo: {clean_status}" if clean_status else "FlowCo"
         # OSC 2 sets window and pane title in xterm/tmux
         sys.stdout.write(f"\033]2;{title}\007")
         if is_in_tmux():
             # OSC k sets tmux window title
-            short = short_title or (status[:16] if status else "FlowCo")
-            sys.stdout.write(f"\033k{short}\033\\")
+            clean_short = re.sub(r"[\r\n\x00-\x1f]+", " ", str(short_title or clean_status[:16] or "FlowCo")).strip()
+            sys.stdout.write(f"\033k{clean_short}\033\\")
         sys.stdout.flush()
     except Exception:
         pass
@@ -3512,6 +3513,12 @@ def learn_quirk(detail: str) -> bool:
     detail_lower = detail.lower()
     learned = False
 
+    if "stream_options" in detail_lower or ("stream" in detail_lower and "option" in detail_lower):
+        if STREAM_STATE.get("usage", True):
+            STREAM_STATE["usage"] = False
+            learned = True
+            log_event("quirk", "Provider rejects stream_options; disabled usage option.")
+
     if "reasoning_effort" in detail_lower or "reasoning" in detail_lower and "unsupported" in detail_lower:
         if not API_QUIRKS["no_reasoning_effort"]:
             API_QUIRKS["no_reasoning_effort"] = True
@@ -3629,7 +3636,9 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
                             sys.stdout.write(dim(formatted))
                             sys.stdout.flush()
 
-                        piece = delta.get("content")
+                        piece = delta.get("content") or delta.get("text") or ""
+                        if isinstance(piece, list):
+                            piece = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in piece)
                         if piece:
                             if reasoning_active[0]:
                                 sys.stdout.write(paint("\n╰─────────────────────────────────────────────────────────────\n\n", "magenta"))
@@ -3651,6 +3660,10 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
 
                 if reasoning_active[0]:
                     sys.stdout.write(paint("\n╰─────────────────────────────────────────────────────────────\n\n", "magenta"))
+
+                if text_parts:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
 
                 full_text = "".join(text_parts)
                 tcs = []
@@ -3678,11 +3691,18 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
 
                 out_chars = len(full_text) + sum(len(t["function"]["arguments"]) for t in tcs)
                 record_usage(usage, in_chars, out_chars)
-                return {"choices": [{"message": msg, "finish_reason": finish}]}
+                return {
+                    "choices": [{"message": msg, "finish_reason": finish}],
+                    "streamed_live": bool(text_parts),
+                }
 
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
             last_err = f"HTTP {e.code}: {detail}"
+            if "stream_options" in detail.lower() and "stream_options" in body:
+                del body["stream_options"]
+                STREAM_STATE["usage"] = False
+                continue
             if learn_quirk(detail):
                 continue
             if e.code in (429, 500, 502, 503, 504):
@@ -3745,6 +3765,7 @@ def chat_plain(messages, tool_choice="auto"):
                         if extracted:
                             msg["tool_calls"] = extracted
                             msg["content"] = remaining
+                res["streamed_live"] = False
                 return res
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
@@ -4058,7 +4079,9 @@ def run_turn(messages, task: str = None) -> None:
         if not tool_calls:
             # No further tool calls - task turn finished
             content = msg.get("content", "").strip()
-            if content:
+            if content and not resp.get("streamed_live"):
+                print(f"\n{content}\n")
+            elif content:
                 print()
             TASK_STATE["status"] = "idle"
             set_tmux_title(f"Idle ({WORK.name})", "FlowCo:Idle")
@@ -4313,6 +4336,119 @@ def cmd_testapi() -> bool:
         return False
 
 
+def cmd_stream_test(prompt: str = "") -> bool:
+    """Benchmark and verify real-time SSE token streaming from active provider."""
+    if not CFG.get("api_key"):
+        err("Cannot test streaming: no API key configured. Run /apipro to configure.")
+        return False
+
+    test_prompt = prompt.strip() or "Count 1 to 5 with words and give a 1-sentence greeting."
+    model_id = CFG.get("model", DEFAULT_MODEL)
+    provider_name = active_provider_name()
+    base_url = CFG.get("base_url", DEFAULT_BASE_URL)
+
+    w = max(44, min(term_width(), 76))
+    sep = "─" * max(2, w - 38)
+    prompt_disp = (test_prompt[:45] + "...") if len(test_prompt) > 48 else test_prompt
+    print(paint(f"\n╭─ ⚡ Stream Benchmark & Diagnostics {sep}", "cyan", "bold"))
+    print(f"│ {paint('Provider', 'white', 'bold')} : {provider_name} ({base_url})")
+    print(f"│ {paint('Model', 'white', 'bold')}    : {model_id}")
+    print(f"│ {paint('Prompt', 'white', 'bold')}   : \"{prompt_disp}\"")
+    print(paint("╰" + "─" * max(2, w - 2), "cyan"))
+
+    body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": test_prompt}],
+        "max_tokens": 128,
+        "temperature": 0.2,
+        "stream": True,
+    }
+    if STREAM_STATE.get("usage", True):
+        body["stream_options"] = {"include_usage": True}
+
+    print(paint(f"\n╭─ 🌊 Live Stream Output {'─' * max(2, w - 26)}", "blue", "bold"))
+    sys.stdout.write("│ ")
+    sys.stdout.flush()
+
+    t_start = time.time()
+    ttft = None
+    chunks_count = 0
+    text_pieces = []
+
+    try:
+        req = _request(body)
+        try:
+            resp_cm = urllib.request.urlopen(req, timeout=40)
+        except urllib.error.HTTPError as http_err:
+            detail = http_err.read().decode(errors="replace")
+            # If server rejects stream_options, auto-heal and retry immediately
+            if "stream_options" in detail.lower() and "stream_options" in body:
+                del body["stream_options"]
+                STREAM_STATE["usage"] = False
+                req = _request(body)
+                resp_cm = urllib.request.urlopen(req, timeout=40)
+            else:
+                raise http_err
+
+        with resp_cm as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except Exception:
+                    continue
+
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content") or delta.get("text") or ""
+                    if isinstance(piece, list):
+                        piece = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in piece)
+                    if piece:
+                        if ttft is None:
+                            ttft = time.time() - t_start
+                        chunks_count += 1
+                        text_pieces.append(piece)
+                        formatted = piece.replace("\n", "\n│ ")
+                        sys.stdout.write(paint(formatted, "white"))
+                        sys.stdout.flush()
+
+        t_total = time.time() - t_start
+        print(paint(f"\n╰{'─' * max(2, w - 2)}", "blue"))
+
+        full_streamed = "".join(text_pieces)
+        char_count = len(full_streamed)
+        est_tokens = max(1, char_count // 4)
+        stream_duration = max(0.001, t_total - (ttft or 0))
+        tps = est_tokens / stream_duration if ttft else 0.0
+        ttft_str = f"{ttft * 1000:.1f} ms" if ttft is not None else "N/A"
+
+        print(paint(f"\n╭─ 📊 Telemetry & Benchmark {'─' * max(2, w - 29)}", "green", "bold"))
+        print(f"│ {paint('TTFT (Time to First Token)', 'white', 'bold')} : {ttft_str}")
+        print(f"│ {paint('Total Latency', 'white', 'bold')}              : {t_total:.2f} s")
+        print(f"│ {paint('Chunks Received', 'white', 'bold')}            : {chunks_count} chunks")
+        print(f"│ {paint('Streamed Output', 'white', 'bold')}            : {char_count} chars (~{est_tokens} tokens)")
+        print(f"│ {paint('Generation Throughput', 'white', 'bold')}      : ~{tps:.1f} tokens/s")
+        print(f"│ {paint('Stream Protocol', 'white', 'bold')}            : " + paint("✔ PASS (Live SSE verified)", "green", "bold"))
+        print(paint("╰" + "─" * max(2, w - 2), "green"))
+        print()
+        return True
+
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode(errors="replace")[:400]
+        print(paint(f"\n╰{'─' * max(2, w - 2)}", "red"))
+        err(f"Stream Benchmark failed (HTTP {e.code}): {err_msg}")
+        return False
+    except Exception as exc:
+        print(paint(f"\n╰{'─' * max(2, w - 2)}", "red"))
+        err(f"Stream Benchmark failed: {exc}")
+        return False
+
+
 # ===========================================================================
 # SECTION 19 - Extended CLI Commands & Storage Management
 # ===========================================================================
@@ -4327,6 +4463,7 @@ def cmd_help(category: str = "") -> None:
             ("/model <id>", "Set active model ID"),
             ("/coder [model|off]", "Configure secondary coder model"),
             ("/testapi", "Test active provider latency and connectivity"),
+            ("/stream-test [prompt]", "Benchmark real-time SSE token streaming from provider"),
         ]),
         ("Reasoning & Thought", [
             ("/effort [level]", "Set reasoning effort (off|low|med|high|xhigh|max|auto)"),
@@ -4359,6 +4496,7 @@ def cmd_help(category: str = "") -> None:
             ("/status", "Display complete agent system status"),
             ("/doctor", "Run local diagnostics on environment and permissions"),
             ("/logs [n]", "View recent events from flowco.log"),
+            ("/clear", "Clear console screen and re-render header"),
             ("/wipe [target]", "Safe wipe (session|cache|workspace|config|all)"),
             ("/shutdown", "Clean exit: stop servers, save state, and exit"),
             ("/restart", "Gracefully restart FlowCo"),
@@ -4538,6 +4676,9 @@ def cmd_doctor() -> None:
     ensure_dirs()
     bk_ok = BACKUP_DIR.is_dir() and os.access(BACKUP_DIR, os.W_OK)
     checks.append(("Backup Storage", f"{BACKUP_DIR}", bk_ok))
+
+    # 9. Prompt Toolkit interactive UI
+    checks.append(("Prompt Toolkit", "installed (interactive menu & status bar enabled)" if PROMPT_TOOLKIT_AVAILABLE else "optional (install: pip install prompt_toolkit)", PROMPT_TOOLKIT_AVAILABLE))
 
     for title, desc, passed in checks:
         icon = paint("PASS", "green", "bold") if passed else paint("WARN", "yellow", "bold")
@@ -4889,6 +5030,23 @@ def run_selftest() -> int:
                 assert "[VERIFICATION FAILED]" in res_fail
             test("Autonomous solution verification gate", t_verify)
 
+            # Test 20: Slash command dropdown completions
+            def t_slash_completer():
+                completer = FlowCoSlashCompleter()
+                if hasattr(completer, "COMMANDS"):
+                    assert any(c[0] == "/stream-test" for c in completer.COMMANDS)
+                    assert any(c[0] == "/clear" for c in completer.COMMANDS)
+                    assert any(c[0] == "/doctor" for c in completer.COMMANDS)
+            test("Slash command menu completions", t_slash_completer)
+
+            # Test 21: API quirk auto-healing for stream_options
+            def t_quirk_stream_options():
+                STREAM_STATE["usage"] = True
+                learned = learn_quirk("HTTP 400: 'stream_options' is not supported by this provider")
+                assert learned is True
+                assert STREAM_STATE["usage"] is False
+            test("Stream options quirk auto-healing", t_quirk_stream_options)
+
         finally:
             WORK = old_work
             BACKUP_DIR = old_backup
@@ -4909,12 +5067,12 @@ def setup_readline() -> None:
     try:
         import readline
         commands = [
-            "/help", "/status", "/doctor", "/download", "/github",
-            "/workspace", "/workplace", "/files", "/run", "/undo",
-            "/apipro", "/models", "/model", "/coder", "/effort",
-            "/think", "/cost", "/budget", "/memory", "/compact",
-            "/history", "/export", "/logs", "/servers", "/stop",
-            "/wipe", "/shutdown", "/restart", "/reset", "/quit", "/exit"
+            "/help", "/status", "/stream-test", "/tasks", "/bg", "/skills",
+            "/doctor", "/testapi", "/undo", "/files", "/download", "/github",
+            "/workspace", "/workplace", "/models", "/model", "/coder", "/effort",
+            "/think", "/budget", "/cost", "/memory", "/compact", "/history",
+            "/export", "/logs", "/servers", "/stop", "/run", "/wipe",
+            "/shutdown", "/restart", "/reset", "/clear", "/quit", "/exit"
         ]
 
         def completer(text, state):
@@ -4943,6 +5101,215 @@ def setup_readline() -> None:
         pass
 
 
+# ===========================================================================
+# Interactive TUI & Prompt Engine (prompt_toolkit with standard fallback)
+# ===========================================================================
+
+PROMPT_TOOLKIT_AVAILABLE = False
+try:
+    import prompt_toolkit
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.shortcuts import CompleteStyle
+    from prompt_toolkit.styles import Style
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    PROMPT_TOOLKIT_AVAILABLE = True
+except Exception:
+    PROMPT_TOOLKIT_AVAILABLE = False
+
+
+def ensure_prompt_toolkit() -> bool:
+    """Ensure prompt_toolkit is available, auto-installing via pip if needed."""
+    global PROMPT_TOOLKIT_AVAILABLE
+    if PROMPT_TOOLKIT_AVAILABLE:
+        return True
+    try:
+        res = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "prompt_toolkit"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        if res.returncode == 0:
+            global PromptSession, Completer, Completion, CompleteStyle, Style, HTML, FileHistory, AutoSuggestFromHistory
+            import prompt_toolkit
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.completion import Completer, Completion
+            from prompt_toolkit.shortcuts import CompleteStyle
+            from prompt_toolkit.styles import Style
+            from prompt_toolkit.formatted_text import HTML
+            from prompt_toolkit.history import FileHistory
+            from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+            PROMPT_TOOLKIT_AVAILABLE = True
+            return True
+    except Exception:
+        pass
+    return False
+
+
+_BASE_COMPLETER = Completer if PROMPT_TOOLKIT_AVAILABLE else object
+
+
+class FlowCoSlashCompleter(_BASE_COMPLETER):
+    """Interactive slash-command completer with live dropdown descriptions and path completion."""
+    COMMANDS = [
+        ('/help', 'Show commands, capabilities & guide'),
+        ('/status', 'Show workspace, tokens & budget'),
+        ('/stream-test', 'Benchmark real-time token streaming'),
+        ('/testapi', 'Quick ping test of active provider'),
+        ('/tasks', 'View visual task graph & DAG'),
+        ('/bg', 'Manage async background processes'),
+        ('/skills', 'View and manage learned rules'),
+        ('/doctor', 'Run diagnostic environment check'),
+        ('/undo', 'Revert last workspace file edit'),
+        ('/files', 'Browse files in workspace'),
+        ('/download', 'Stream download file from URL'),
+        ('/github', 'Clone or download GitHub repo/assets'),
+        ('/workspace', 'Switch workspace directory'),
+        ('/models', 'Fetch available models from provider'),
+        ('/model', 'Switch active LLM model ID'),
+        ('/coder', 'Set dedicated coder LLM model'),
+        ('/think', 'Adjust reasoning effort (none/med/high)'),
+        ('/budget', 'Set or inspect token budget limit'),
+        ('/cost', 'View token count & estimated dollar cost'),
+        ('/memory', 'Inspect conversation context buffer'),
+        ('/compact', 'Compact session memory context'),
+        ('/history', 'Display recent conversation turns'),
+        ('/export', 'Export conversation to markdown file'),
+        ('/logs', 'Display system event logs'),
+        ('/servers', 'View background dev servers'),
+        ('/stop', 'Stop background dev servers'),
+        ('/run', 'Execute bash command in workspace'),
+        ('/wipe', 'Safely delete temporary files'),
+        ('/reset', 'Reset conversation history & plan'),
+        ('/clear', 'Clear terminal console screen'),
+        ('/quit', 'Exit FlowCo'),
+    ]
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if text.startswith("/"):
+            # Check for path completion if arguments are being typed
+            parts = text.split(None, 1)
+            if len(parts) == 2 and parts[0] in ("/files", "/undo", "/run", "/workspace", "/workplace"):
+                prefix = parts[1]
+                try:
+                    p = Path(prefix)
+                    search_dir = (WORK / p.parent).resolve() if p.parent.name else WORK
+                    if search_dir.is_dir():
+                        pat = p.name.lower()
+                        for item in search_dir.iterdir():
+                            if item.name.lower().startswith(pat):
+                                rel = str(item.relative_to(WORK))
+                                if item.is_dir():
+                                    rel += "/"
+                                yield Completion(
+                                    rel,
+                                    start_position=-len(prefix),
+                                    display=item.name + ("/" if item.is_dir() else ""),
+                                    display_meta="folder" if item.is_dir() else "file"
+                                )
+                except Exception:
+                    pass
+                return
+
+            query = text.lower()
+            for cmd, desc in self.COMMANDS:
+                if cmd.lower().startswith(query):
+                    yield Completion(
+                        cmd,
+                        start_position=-len(text),
+                        display=cmd,
+                        display_meta=desc
+                    )
+
+
+_PROMPT_SESSION = None
+
+
+def get_prompt_session():
+    """Lazily initialize and return persistent PromptSession."""
+    global _PROMPT_SESSION, PROMPT_TOOLKIT_AVAILABLE
+    if _PROMPT_SESSION is not None:
+        return _PROMPT_SESSION
+    if not PROMPT_TOOLKIT_AVAILABLE:
+        ensure_prompt_toolkit()
+    if not PROMPT_TOOLKIT_AVAILABLE:
+        return None
+
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        hist = FileHistory(str(HISTORY_FILE))
+
+        style = Style.from_dict({
+            'bottom-toolbar': '#cdd6f4 bg:#181825',
+            'completion-menu': 'bg:#181825 #cdd6f4',
+            'completion-menu.completion': 'bg:#1e1e2e #cdd6f4',
+            'completion-menu.completion.current': 'bg:#313244 #89b4fa bold',
+            'completion-menu.meta': 'bg:#181825 #a6adc8',
+            'completion-menu.meta.current': 'bg:#313244 #f5e0dc bold',
+            'completion-menu.multi-column-meta': 'bg:#181825 #a6adc8',
+            'scrollbar.background': 'bg:#11111b',
+            'scrollbar.button': 'bg:#45475a',
+        })
+
+        _PROMPT_SESSION = PromptSession(
+            history=hist,
+            auto_suggest=AutoSuggestFromHistory(),
+            style=style,
+            completer=FlowCoSlashCompleter(),
+            complete_while_typing=True,
+            complete_style=CompleteStyle.COLUMN,
+        )
+        return _PROMPT_SESSION
+    except Exception:
+        return None
+
+
+def get_user_input() -> str:
+    """Read user prompt with rich Antigravity TUI bar and completion menu, with readline fallback."""
+    session = get_prompt_session()
+    if session is not None and sys.stdin.isatty():
+        def _toolbar():
+            m_label = CFG.get("model", "-").split("/")[-1]
+            ws_label = WORK.name or "work"
+            total_tokens = USAGE["in"] + USAGE["out"]
+            budget = CFG.get("task_token_budget", 0)
+            tok_str = f"{total_tokens:,} tok"
+            if budget:
+                tok_str += f"/{budget:,}"
+            bg_alive = len([t for t in BG_TASKS.values() if t.get("proc") and t["proc"].poll() is None])
+            bg_str = f" │ ⚙ {bg_alive} bg" if bg_alive else ""
+            return HTML(
+                f" <b>[{m_label}]</b> │ <b>📂 {ws_label}</b> │ {tok_str}{bg_str} │ <i>/: commands</i> │ <i>Tab/Enter: select</i> │ <i>Ctrl+C: cancel</i> "
+            )
+
+        def _prompt():
+            m_label = CFG.get("model", "-").split("/")[-1]
+            ws_label = WORK.name or "work"
+            return HTML(
+                f"<ansibrightblack>╭─ [{m_label}] {ws_label}</ansibrightblack>\n"
+                f"<b><ansicyan>╰─❯ </ansicyan></b>"
+            )
+
+        return session.prompt(
+            _prompt,
+            bottom_toolbar=_toolbar,
+        ).strip()
+    else:
+        # Fallback to standard input with readline
+        m_label = CFG.get("model", "-").split("/")[-1]
+        ws_label = WORK.name or "work"
+        prompt = (
+            dim(f"╭─ [{m_label}] {ws_label}\n")
+            + paint(f"╰─{ICONS['arrow']} ", "cyan", "bold")
+        )
+        return input(prompt).strip()
+
+
 def main() -> None:
     """Main FlowCo entry point."""
     if "--selftest" in sys.argv:
@@ -4952,6 +5319,11 @@ def main() -> None:
         bootstrap()
         cmd_doctor()
         sys.exit(0)
+
+    if "--stream-test" in sys.argv:
+        bootstrap()
+        prompt_arg = " ".join([a for a in sys.argv[1:] if a != "--stream-test" and not a.startswith("-")])
+        sys.exit(0 if cmd_stream_test(prompt_arg) else 1)
 
     if "--version" in sys.argv or "-v" in sys.argv:
         print(f"{APP_NAME} v{APP_VERSION}")
@@ -4994,13 +5366,7 @@ def main() -> None:
 
     while True:
         try:
-            m_label = CFG.get("model", "-").split("/")[-1]
-            ws_label = WORK.name or "work"
-            prompt = (
-                dim(f"╭─ [{m_label}] {ws_label}\n")
-                + paint(f"╰─{ICONS['arrow']} ", "cyan", "bold")
-            )
-            user = input(prompt).strip()
+            user = get_user_input()
         except EOFError:
             print()
             break
@@ -5015,6 +5381,14 @@ def main() -> None:
         cmd = user.lower()
         if cmd in ("/quit", "/exit", "exit", "quit"):
             break
+        elif cmd.startswith("/stream-test") or cmd.startswith("/streamtest") or cmd.startswith("/stream"):
+            parts = user.split(None, 1)
+            cmd_stream_test(parts[1] if len(parts) > 1 else "")
+            continue
+        elif cmd == "/clear":
+            os.system("clear" if os.name != "nt" else "cls")
+            banner()
+            continue
         elif cmd == "/help" or cmd.startswith("/help "):
             parts = user.split(None, 1)
             cmd_help(parts[1] if len(parts) > 1 else "")

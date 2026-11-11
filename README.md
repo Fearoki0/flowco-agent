@@ -20,11 +20,14 @@ FlowCo is designed to turn your phone into a full-scale AI development station. 
 - **Autonomous Verification Gate (`verify`)**: Executes tests and validates file invariants before declaring completion, stopping hallucinations before they reach the user.
 - **Persistent Learned Skills Library (`learn_skill`, `/skills`)**: Persists lessons, troubleshooting patterns, and compiler workarounds across sessions, automatically injecting relevant rules when similar tasks arise.
 
-### 🖥️ Native Tmux & Terminal UX
+### 🖥️ Native Tmux & Antigravity CLI UX
+- **Interactive Input Bar & Dropdown Command Menu**: Rich `prompt_toolkit` engine with a live floating completion dropdown menu when typing `/`, displaying command descriptions and selectable with Up/Down arrow keys.
+- **Real-Time Token Streaming & Benchmark (`/stream-test`)**: Live SSE text streaming directly to the terminal, complete with time-to-first-token (TTFT) and throughput telemetry.
+- **Bottom Status Toolbar**: Always visible status displaying active Model, Workplace directory, Session tokens/budget, active background jobs, and keyboard shortcuts.
 - **Dynamic Tmux Status & Pane Titles**: Emits terminal OSC escape sequences updating your tmux pane borders and window titles in real time (`FlowCo: [Downloading]`, `FlowCo: [Thinking]`, `FlowCo: [Ready]`).
 - **Terminal Resize (`SIGWINCH`)**: Handles tmux horizontal/vertical pane splits without clipping or breaking layout.
 - **Graceful Interrupts (`Ctrl+C`)**: Cancels running subprocesses or downloads without crashing the agent or closing the terminal session.
-- **Persistent Readline History**: Saves command history in `~/.flowco/history` with slash-command tab-completion.
+- **Persistent History & Auto-Suggestions**: Saves command history in `~/.flowco/history` with fish-style ghost auto-suggestions.
 
 ---
 
@@ -55,6 +58,7 @@ cd work
 
 | Command | Description |
 | :--- | :--- |
+| `/stream-test [prompt]` | Benchmark real-time SSE token streaming, latency (TTFT), and throughput |
 | `/download <url> [dest]` | Download any web file into workplace with progress bar |
 | `/github <repo> [type]` | Clone repository, fetch release asset, or download file from GitHub |
 | `/workspace [path]` | Inspect or switch active workplace folder on internal storage |
@@ -62,6 +66,7 @@ cd work
 | `/bg` | List and monitor running background jobs |
 | `/skills` | Inspect the persistent library of learned rules |
 | `/undo [file] [idx]` | Rollback any file edit using automatic snapshot backups |
+| `/clear` | Clear terminal console screen and redraw branding banner |
 | `/status` | Full system, model, token budget, and environment diagnostics |
 | `/doctor` | Run automated health checks on storage, python, git, and network |
 
