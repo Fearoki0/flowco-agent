@@ -2789,9 +2789,20 @@ def tool_download_file(
                     out_f.write(chunk)
                     sha256_hash.update(chunk)
                     downloaded_bytes += len(chunk)
+                    if sys.stdout.isatty() and content_len > 0:
+                        pct = min(1.0, downloaded_bytes / content_len)
+                        bar_w = 16
+                        filled = int(bar_w * pct)
+                        bar = "█" * filled + "░" * (bar_w - filled)
+                        sys.stdout.write(f"\r  │  [{bar}] {pct*100:3.0f}% ({format_bytes(downloaded_bytes)}/{format_bytes(content_len)})")
+                        sys.stdout.flush()
                     if downloaded_bytes > MAX_DOWNLOAD_BYTES:
                         part_file.unlink(missing_ok=True)
                         return f"Error: Download exceeded maximum safety limit of {format_bytes(MAX_DOWNLOAD_BYTES)}."
+
+            if sys.stdout.isatty() and content_len > 0:
+                sys.stdout.write("\r" + " " * 60 + "\r")
+                sys.stdout.flush()
 
             part_file.replace(target_file)
             part_file = None
@@ -3612,15 +3623,16 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
                         r_text = extract_reasoning(delta)
                         if r_text and CFG.get("show_reasoning"):
                             if not reasoning_active[0]:
-                                sys.stdout.write(paint("\n[thinking] ", "magenta"))
+                                sys.stdout.write(paint("\n╭─ 🧠 Thinking Process ────────────────────────────────────────\n│ ", "magenta", "bold"))
                                 reasoning_active[0] = True
-                            sys.stdout.write(dim(r_text))
+                            formatted = r_text.replace("\n", "\n│ ")
+                            sys.stdout.write(dim(formatted))
                             sys.stdout.flush()
 
                         piece = delta.get("content")
                         if piece:
                             if reasoning_active[0]:
-                                sys.stdout.write("\n\n")
+                                sys.stdout.write(paint("\n╰─────────────────────────────────────────────────────────────\n\n", "magenta"))
                                 reasoning_active[0] = False
                             text_parts.append(piece)
                             sys.stdout.write(piece)
@@ -3638,7 +3650,7 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
                                 slot["args"].append(fn["arguments"])
 
                 if reasoning_active[0]:
-                    sys.stdout.write("\n")
+                    sys.stdout.write(paint("\n╰─────────────────────────────────────────────────────────────\n\n", "magenta"))
 
                 full_text = "".join(text_parts)
                 tcs = []
