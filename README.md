@@ -8,6 +8,24 @@ FlowCo is designed to turn low-resource mobile and terminal environments into a 
 
 ## ✨ Key Features in FlowCo v5.0
 
+### 🧠 Token Auto-Compaction & Persistent Brain Memory
+- **Autonomous Compaction at 150k/250k Tokens**: Monitors active context tokens and automatically condenses older dialogue into a compact memory anchor when reaching threshold limits (configurable via `/settings set auto_compact_tokens <tokens>`).
+- **Persistent Brain Memory Files**: Actively tracks and persists architectural decisions, touched files, verified facts, and execution plans to `.flowco/memory.json` and human-readable `.flowco/MEMORY.md`.
+- **KV Prompt Cache Optimization**: Keeps static instructions byte-identical at the prompt prefix to maximize 80–90% token discounts on caching providers (OpenAI, DeepSeek, Anthropic, OpenRouter).
+- **Read-Loop Circuit Breaker**: Detects repetitive read-only queries with zero code progress and halts context thrashing before token budgets burn out.
+
+### 🛡️ Dedicated Isolated Local Sandbox (`.sandbox/`)
+- **Safe Code & Test Execution**: Autonomous tool `run_sandbox` executes temporary code, algorithms, and tests inside `.sandbox/` with an isolated `$HOME`, sanitized `$TMPDIR`, and clean environment without polluting workspace context.
+- **Dedicated Sandbox Isolation Mode**: `/sandbox isolated` switches all shell commands to run inside the workspace sandbox directory.
+
+### 🤖 Live Model Capability Probe & Safety Warning Bar
+- **Live Endpoint Querying & Capability Matrix**: Probes active model parameters (DeepSeek R1/V3, OpenAI o1/o3-mini, GPT-4o, Claude 3.5, Gemini Thinking, Qwen, Ollama, Llama).
+- **Proactive Incompatibility Warning Bar**: Flags when configured settings conflict with model capabilities (e.g., custom temperature or system prompt roles on `o1`), auto-omitting unsupported parameters to prevent HTTP 400 Bad Request failures.
+
+### 🖥️ Interactive Settings Dashboard (`/settings`) & Thinking Collapse (`Ctrl+O`)
+- **Interactive Configuration Panel (`/settings`)**: Unified TUI dashboard for terminal display, sandbox isolation, token auto-compaction thresholds, command timeouts, and model parameters.
+- **Thinking Process & Output Collapse (`Ctrl+O` & `/thinking`)**: Toggle verbose model chain-of-thought and multi-line task execution output into compact single-line badges with a single keystroke (`Ctrl+O`) or slash command (`/thinking toggle`).
+
 ### 🛡️ Centralized Token Budget & Spending Safety
 - **Strict Separation of Accounting**: Independent tracking of **Current Task Usage**, **Session Usage**, and per-**Provider Usage**. Starting a new task refreshes task allowances without wiping session history.
 - **Pre-Request Gate Checks**: Every model invocation (main loop, subagents, coder model, benchmarks, and diagnostic pings) is evaluated by the central `BudgetManager` before dispatch.
@@ -66,7 +84,7 @@ cd /storage/emulated/0/agentsflowW/work
 Verify 100% offline functionality (zero network calls, zero token consumption):
 
 ```bash
-# Run comprehensive 38-test offline test suite
+# Run comprehensive 47-test offline test suite
 flowco --selftest
 
 # Run environment and storage health checks
@@ -79,10 +97,15 @@ flowco --doctor
 
 | Command | Description |
 | :--- | :--- |
+| `/settings [set\|reset\|show]` | Interactive configuration dashboard for terminal, sandbox, compaction & model |
+| `/thinking [toggle\|on\|off]` | Toggle collapse/expand of model thinking process and verbose output (`Ctrl+O`) |
+| `/model [id]` | Inspect active model capabilities, probe live architecture, or switch model |
 | `/local [use <preset>]` | Scan loopback ports & auto-switch to local models (Ollama, llama.cpp, etc.) |
 | `/budget [add <tokens>]` | View token usage, remaining allowance, or extend task budget |
 | `/cost` | Display session token ledger and dollar cost from provider rates |
-| `/sandbox [mode]` | Inspect or switch sandbox execution mode (`local`, `proot`, `off`, `auto`) |
+| `/memory` | Inspect active execution plan, touched files, and persistent brain state |
+| `/compact` | Compact conversation history into brain memory anchor |
+| `/sandbox [mode]` | Inspect or switch sandbox mode (`isolated`, `local`, `proot`, `off`, `auto`) |
 | `/stream-test [prompt]` | Benchmark real-time SSE token streaming, latency (TTFT), and throughput |
 | `/tasks` | View the live execution task DAG and completion states |
 | `/bg [kill <id>\|clear]` | List, inspect, kill, or clear background jobs |

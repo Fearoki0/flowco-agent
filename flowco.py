@@ -117,7 +117,7 @@ KEEP_FULL = 6                # newest messages never shrunk
 
 SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", ".cache", ".tmp", ".venv",
-    "venv", ".flowco-cache",
+    "venv", ".flowco-cache", ".sandbox", ".flowco",
 }
 
 CONTINUATIONS = {"continue", "go on", "keep going", "resume", "next", "yes", "ok"}
@@ -136,7 +136,7 @@ SHARED_DEFAULTS = {
     "schema": SCHEMA_VERSION,
     "active_provider": DEFAULT_PROFILE_NAME,
     "workspace": "",
-    "sandbox": "auto",              # auto | proot | local | off
+    "sandbox": "auto",              # auto | proot | local | isolated | off
     "proot_distro": "ubuntu",
     "max_steps": 40,
     "cmd_timeout": 120,
@@ -145,6 +145,10 @@ SHARED_DEFAULTS = {
     "max_tokens": 8192,
     "stream": True,
     "show_reasoning": True,
+    "collapse_thinking": False,
+    "auto_compact_tokens": 150000,   # auto-compact threshold (150k or 250k)
+    "tool_routing": False,           # dynamic tool pruning by phase
+    "theme": "default",
     "context_budget_chars": 30000,
     "task_token_budget": 250000,     # 0 = unlimited
     "session_token_budget": 0,       # 0 = unlimited
@@ -157,6 +161,8 @@ SHARED_DEFAULTS = {
     "coder_max_tokens": 12000,
     "backup_keep": 20,               # snapshots retained per file
 }
+
+DEFAULT_CONFIG = dict(SHARED_DEFAULTS)
 
 # Provider-dependent settings live inside each profile.
 PROFILE_DEFAULTS = {
@@ -1233,7 +1239,7 @@ def _coerce_shared(cfg: dict) -> dict:
         cfg[key] = value.strip() if isinstance(value, str) else SHARED_DEFAULTS[key]
 
     sandbox = str(cfg.get("sandbox") or "auto").strip().lower()
-    if sandbox not in ("auto", "proot", "local", "off"):
+    if sandbox not in ("auto", "proot", "local", "isolated", "off"):
         warn("Invalid sandbox mode; defaulting to 'auto'.")
         sandbox = "auto"
     cfg["sandbox"] = sandbox
@@ -2403,6 +2409,10 @@ def setup_sandbox() -> None:
         SANDBOX.update(mode="off", note="command execution disabled")
         return
 
+    if want == "isolated":
+        SANDBOX.update(mode="isolated", note="isolated local workspace sandbox (.sandbox/) with clean environment")
+        return
+
     if want == "local":
         SANDBOX.update(mode="local", note="restricted local execution (no OS isolation; guarded regex & path boundaries)")
         return
@@ -2419,11 +2429,108 @@ def setup_sandbox() -> None:
         # Do not silently fall back to local execution. Disable commands until user explicitly chooses.
         SANDBOX.update(
             mode="off",
-            note="PRoot isolation unavailable (" + msg + "). Commands disabled for safety. Run '/sandbox local' to explicitly enable restricted local execution."
+            note="PRoot isolation unavailable (" + msg + "). Commands disabled for safety. Run '/sandbox local' or '/sandbox isolated' to enable."
         )
         return
 
     SANDBOX.update(mode="local", note="restricted local execution (no OS isolation)")
+
+
+def ensure_sandbox_env() -> Path:
+    """Ensure dedicated isolated sandbox directory structure exists inside the workspace."""
+    sb = WORK / ".sandbox"
+    sb.mkdir(parents=True, exist_ok=True)
+    (sb / ".tmp").mkdir(parents=True, exist_ok=True)
+    (sb / "scripts").mkdir(parents=True, exist_ok=True)
+    return sb
+
+
+def sandbox_env() -> dict:
+    """Sanitized execution environment for sandbox scripts and tests."""
+    sb = ensure_sandbox_env()
+    env = {k: v for k, v in os.environ.items() if k in (
+        "PATH", "LANG", "LC_ALL", "TERM", "LD_LIBRARY_PATH", "LD_PRELOAD"
+    )}
+    env.update(
+        HOME=str(sb),
+        TMPDIR=str(sb / ".tmp"),
+        PWD=str(sb),
+        PYTHONPATH=str(WORK),
+    )
+    return env
+
+
+def brain_memory_path() -> Path:
+    return WORK / ".flowco" / "memory.json"
+
+
+def brain_markdown_path() -> Path:
+    return WORK / ".flowco" / "MEMORY.md"
+
+
+def load_brain_memory() -> dict:
+    """Load persistent agent brain memory state from disk."""
+    mf = brain_memory_path()
+    if mf.is_file():
+        try:
+            return json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "task_goal": "",
+        "decisions": [],
+        "touched_files": {},
+        "verified_facts": [],
+        "active_plan": "",
+        "milestones": [],
+        "last_updated": "",
+    }
+
+
+def update_brain_memory(goal: str = None, decision: str = None, file_touched: str = None, note: str = None, verified: str = None, plan: str = None) -> dict:
+    """Update and persist structured agent brain state to disk."""
+    mem = load_brain_memory()
+    if goal:
+        mem["task_goal"] = goal
+    if decision and decision not in mem["decisions"]:
+        mem["decisions"].append(decision)
+        if len(mem["decisions"]) > 30:
+            mem["decisions"] = mem["decisions"][-30:]
+    if file_touched:
+        mem["touched_files"][file_touched] = note or "modified"
+    if verified and verified not in mem["verified_facts"]:
+        mem["verified_facts"].append(verified)
+        if len(mem["verified_facts"]) > 20:
+            mem["verified_facts"] = mem["verified_facts"][-20:]
+    if plan:
+        mem["active_plan"] = plan
+    mem["last_updated"] = now_stamp()
+
+    mf = brain_memory_path()
+    mf.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mf.write_text(json.dumps(mem, indent=2, ensure_ascii=False), encoding="utf-8")
+        md = [
+            "# 🧠 FlowCo Agent Memory State",
+            f"**Last Updated:** {mem['last_updated']}",
+            f"**Current Goal:** {mem['task_goal'] or '(none)'}",
+            "",
+            "## Architectural Decisions",
+        ]
+        for d in mem["decisions"]:
+            md.append(f"- {d}")
+        md.append("\n## Touched Files")
+        for f, n in mem["touched_files"].items():
+            md.append(f"- `{f}` ({n})")
+        md.append("\n## Verified Ground Truths")
+        for v in mem["verified_facts"]:
+            md.append(f"- [PASS] {v}")
+        if mem.get("active_plan"):
+            md.append(f"\n## Active Plan\n```\n{mem['active_plan']}\n```")
+        brain_markdown_path().write_text("\n".join(md), encoding="utf-8")
+    except Exception:
+        pass
+    return mem
 
 
 _ALLOWED_DEV = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/zero"}
@@ -2485,7 +2592,9 @@ def exec_command(command: str, timeout: int = None) -> str:
     if mode == "off":
         return "Error: sandbox is disabled."
 
-    if mode == "proot":
+    if mode == "isolated":
+        argv, cwd, env = ["bash", "-c", command], str(ensure_sandbox_env()), sandbox_env()
+    elif mode == "proot":
         argv, cwd, env = proot_argv(command), None, local_env()
     else:
         blocked = local_guard(command)
@@ -2567,6 +2676,65 @@ def tool_run_command(command: str) -> str:
         return msg
 
     return exec_command(command)
+
+
+def tool_run_sandbox(command: str = "", script_code: str = "", script_name: str = "") -> str:
+    """Execute code or tests inside an isolated sandbox environment (.sandbox/) without polluting the workspace."""
+    sb = ensure_sandbox_env()
+    target_cmd = (command or "").strip()
+
+    if script_code:
+        sname = (script_name or "").strip() or f"test_{short_stamp()}.py"
+        if not sname.endswith((".py", ".sh", ".js")):
+            sname += ".py"
+        spath = sb / "scripts" / sname
+        try:
+            spath.write_text(script_code, encoding="utf-8")
+            TASK_STATE["touches"].add(rel(spath))
+            if not target_cmd:
+                if sname.endswith(".py"):
+                    target_cmd = f"python3 scripts/{sname}"
+                else:
+                    target_cmd = f"bash scripts/{sname}"
+        except Exception as e:
+            return f"Error writing sandbox script: {e}"
+
+    if not target_cmd:
+        return "Error: sandbox execution requires 'command' or 'script_code'."
+
+    allowed, msg = check_command_confirmation(f"[SANDBOX] {target_cmd}")
+    if not allowed:
+        return msg
+
+    argv = ["bash", "-c", target_cmd]
+    timeout_val = int(CFG.get("cmd_timeout", 120))
+    set_tmux_title(f"[Sandbox] {clip(target_cmd, 25)}", "FlowCo:Sandbox")
+
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(sb),
+            env=sandbox_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
+        try:
+            out, _ = proc.communicate(timeout=timeout_val)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            return clip("[Sandbox timeout expired]\n[killed: timed out]")
+        return clip((out or "").strip() + f"\n[exit code {proc.returncode}]", MAX_TOOL_OUTPUT)
+    except Exception as e:
+        return f"Error running sandbox command: {e}"
+    finally:
+        set_tmux_title("Idle", "FlowCo:Idle")
 
 
 # ===========================================================================
@@ -3836,6 +4004,40 @@ def tool_verify(command: str = "", check_file: str = "", syntax_check: str = "")
     return "[VERIFICATION PASSED]\nAll verification checks succeeded."
 
 
+def tool_ask_user(question: str, options: list = None) -> str:
+    """Prompt the user with a clarifying question or design choice when encountering ambiguities or roadblocks."""
+    q = (question or "").strip()
+    if not q:
+        return "Error: question text is required."
+
+    if not sys.stdin.isatty() or os.environ.get("FLOWCO_TEST_MODE") == "1" or "unittest" in sys.modules:
+        return "[Non-Interactive Mode]: User cannot respond interactively. Proceed with the safest default design or report the constraint."
+
+    print()
+    q_bar = "╭── ❓ FlowCo Question for User ──────────────────────────────"
+    print(paint(q_bar, "cyan", "bold"))
+    for line in q.splitlines():
+        print(paint(f"│ {line}", "cyan"))
+
+    opts = options if isinstance(options, list) else []
+    if opts:
+        print(paint("│", "cyan"))
+        for i, opt in enumerate(opts, 1):
+            print(paint(f"│   [{i}] {opt}", "yellow"))
+    print(paint("╰────────────────────────────────────────────────────────────", "cyan", "bold"))
+
+    try:
+        ans = input(paint("  Your answer ❯ ", "green", "bold")).strip()
+        if not ans and opts:
+            ans = str(opts[0])
+        elif not ans:
+            ans = "(no response provided)"
+        ok(f"User response received: {clip(ans, 60)}")
+        return f"[User Response]: {ans}"
+    except (EOFError, KeyboardInterrupt):
+        return "[User cancelled response (Ctrl+C / EOF). Proceed with safest default.]"
+
+
 def tool_learn_skill(name: str, trigger: str, solution: str) -> str:
     """Persist a learned rule, troubleshooting pattern, or compilation flag across sessions."""
     nm = str(name or "").strip()
@@ -3985,6 +4187,7 @@ TOOL_FUNCS = {
     "search_files": tool_search_files,
     "update_plan": tool_update_plan,
     "run_command": tool_run_command,
+    "run_sandbox": tool_run_sandbox,
     "start_server": tool_start_server,
     "stop_servers": tool_stop_servers,
     "write_code": tool_write_code,
@@ -3999,6 +4202,7 @@ TOOL_FUNCS = {
     "kill_task": tool_kill_task,
     "task_graph": tool_task_graph,
     "verify": tool_verify,
+    "ask_user": tool_ask_user,
     "learn_skill": tool_learn_skill,
     "spawn_subagent": tool_spawn_subagent,
     "git": tool_git,
@@ -4044,6 +4248,11 @@ def build_tools():
                "command": {"type": "string", "description": "Verification or test command to run."},
                "check_file": {"type": "string", "description": "Optional file path that must exist and be non-empty."}
            }, ["command"]),
+        fn("ask_user", "Ask the user a clarifying question or design choice when encountering ambiguities, roadblocks, or critical trade-offs.",
+           {
+               "question": {"type": "string", "description": "Clear, direct question to ask the user."},
+               "options": {"type": "array", "items": {"type": "string"}, "description": "Optional list of discrete choices for the user."}
+           }, ["question"]),
         fn("learn_skill", "Persist a reusable lesson, compiler flag, or workaround to the skill library.",
            {
                "name": {"type": "string", "description": "Name of the skill or technique."},
@@ -4098,6 +4307,12 @@ def build_tools():
                "release_tag": {"type": "string", "description": "Release tag (e.g. 'v1.0.0') or 'latest'."}
            }, ["repo"]),
         fn("run_command", "Run a shell command inside the sandbox/workspace.", {"command": S}, ["command"]),
+        fn("run_sandbox", "Execute isolated code or test scripts safely in .sandbox/ without polluting workspace context.",
+           {
+               "command": {"type": "string", "description": "Shell command to run in sandbox."},
+               "script_code": {"type": "string", "description": "Optional inline script code to write and run in sandbox."},
+               "script_name": {"type": "string", "description": "Optional script filename, e.g. 'test_algo.py'."}
+           }, []),
         fn("start_server", "Start a local background HTTP preview server.",
            {"command": {"type": "string"}, "port": {"type": "integer"}, "page": {"type": "string"}}, []),
         fn("stop_servers", "Stop all running background preview servers.", {}, []),
@@ -4117,6 +4332,134 @@ def build_tools():
 # SECTION 15 - API Layer, Quirk Learning & Robust Retries
 # ===========================================================================
 
+KNOWN_CAPABILITIES = {
+    # Reasoning models
+    "r1": {"reasoning": True, "custom_temp": True, "sys_role": True, "ctx": 131072, "tools": True, "family": "DeepSeek R1 Reasoning"},
+    "deepseek-reasoner": {"reasoning": True, "custom_temp": False, "sys_role": True, "ctx": 65536, "tools": True, "family": "DeepSeek Reasoner"},
+    "o1": {"reasoning": True, "custom_temp": False, "sys_role": False, "ctx": 200000, "tools": True, "family": "OpenAI o1 Reasoning"},
+    "o1-mini": {"reasoning": True, "custom_temp": False, "sys_role": False, "ctx": 128000, "tools": True, "family": "OpenAI o1-mini"},
+    "o3-mini": {"reasoning": True, "custom_temp": False, "sys_role": False, "ctx": 200000, "tools": True, "family": "OpenAI o3-mini Reasoning"},
+    "qwq": {"reasoning": True, "custom_temp": True, "sys_role": True, "ctx": 131072, "tools": True, "family": "Qwen QwQ Reasoning"},
+    "thinking": {"reasoning": True, "custom_temp": True, "sys_role": True, "ctx": 1048576, "tools": True, "family": "Thinking Model (e.g. Gemini)"},
+    # General & Coder models
+    "gpt-4o": {"reasoning": False, "custom_temp": True, "sys_role": True, "ctx": 128000, "tools": True, "family": "OpenAI GPT-4o Flagship"},
+    "gpt-4o-mini": {"reasoning": False, "custom_temp": True, "sys_role": True, "ctx": 128000, "tools": True, "family": "OpenAI GPT-4o-mini"},
+    "claude-3-5-sonnet": {"reasoning": False, "custom_temp": True, "sys_role": True, "ctx": 200000, "tools": True, "family": "Anthropic Claude 3.5 Sonnet"},
+    "deepseek-chat": {"reasoning": False, "custom_temp": True, "sys_role": True, "ctx": 65536, "tools": True, "family": "DeepSeek V3 Non-Reasoning"},
+    "qwen": {"reasoning": False, "custom_temp": True, "sys_role": True, "ctx": 131072, "tools": True, "family": "Qwen 2.5"},
+    "llama": {"reasoning": False, "custom_temp": True, "sys_role": True, "ctx": 131072, "tools": True, "family": "Meta Llama 3"},
+    "mistral": {"reasoning": False, "custom_temp": True, "sys_role": True, "ctx": 32768, "tools": True, "family": "Mistral AI"},
+}
+
+
+def probe_model_capabilities(model_id: str = None, base_url: str = None, api_key: str = None) -> dict:
+    """Live probe model metadata from endpoint or infer from architecture matrix."""
+    mid = (model_id or CFG.get("model", "")).strip()
+    burl = clean_base_url(base_url or CFG.get("base_url", ""))
+    key = api_key or CFG.get("api_key", "")
+
+    caps = {
+        "model_id": mid,
+        "family": "Standard LLM",
+        "reasoning": False,
+        "custom_temp": True,
+        "sys_role": True,
+        "ctx": 128000,
+        "tools": True,
+        "source": "inferred",
+    }
+
+    mid_lower = mid.lower()
+    for pattern, known in KNOWN_CAPABILITIES.items():
+        if pattern in mid_lower:
+            caps.update(known)
+            caps["family"] = known.get("family", pattern)
+            caps["source"] = "heuristic_matrix"
+            break
+
+    if burl and key and not os.environ.get("FLOWCO_TEST_MODE"):
+        try:
+            if "openrouter" in burl:
+                req = urllib.request.Request(
+                    "https://openrouter.ai/api/v1/models",
+                    headers={"Authorization": f"Bearer {key}", "User-Agent": "FlowCo/5.0"},
+                )
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    data = json.load(resp)
+                    for item in data.get("data", []):
+                        if item.get("id") == mid:
+                            caps["ctx"] = int(item.get("context_length") or caps["ctx"])
+                            caps["source"] = "live_openrouter"
+                            break
+            elif "11434" in burl or "ollama" in burl:
+                req = urllib.request.Request(
+                    f"{burl}/api/show",
+                    data=json.dumps({"name": mid}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.load(resp)
+                    if "details" in data:
+                        caps["family"] = data.get("details", {}).get("family", "Ollama")
+                        caps["source"] = "live_ollama"
+        except Exception:
+            pass
+
+    return caps
+
+
+def check_model_capability_warnings(caps: dict) -> list:
+    """Compare active configuration against model capabilities and generate warning bar entries."""
+    warnings = []
+    mid = caps.get("model_id", "active model")
+
+    curr_temp = CFG.get("temperature") if CFG.get("temperature") is not None else SHARED_DEFAULTS.get("temperature", 0.2)
+    if not caps.get("custom_temp") and float(curr_temp) != 1.0:
+        warnings.append(
+            f"Model '{mid}' strictly rejects custom temperature ({curr_temp}). Auto-omitted to prevent HTTP 400."
+        )
+
+    if not caps.get("reasoning") and CURRENT.get("reasoning", {}).get("param"):
+        warnings.append(
+            f"Model '{mid}' does not support reasoning_effort. Parameter will be omitted from API requests."
+        )
+
+    max_tok = int(CFG.get("max_tokens", 8192))
+    if max_tok > caps.get("ctx", 128000):
+        warnings.append(
+            f"Configured max_tokens ({max_tok}) exceeds model context limit ({caps.get('ctx')})."
+        )
+
+    return warnings
+
+
+def show_model_capability_card(model_id: str = None) -> dict:
+    """Render structured capability inspection card and warning bar."""
+    caps = probe_model_capabilities(model_id)
+    warnings = check_model_capability_warnings(caps)
+
+    print()
+    print(bold(f"  🤖 Model Capability Profile: {paint(caps['model_id'], 'cyan', 'bold')}"))
+    print(dim("  " + "─" * 58))
+    print(f"  Architecture Family : {caps.get('family', 'Generic')}")
+    print(f"  Context Window      : {caps.get('ctx', 128000):,} tokens")
+    print(f"  Reasoning / CoT     : " + (paint("SUPPORTED", "green", "bold") if caps.get("reasoning") else dim("Not applicable / None")))
+    print(f"  Custom Temperature  : " + (paint("ALLOWED", "green") if caps.get("custom_temp") else paint("RESTRICTED (fixed 1.0)", "yellow", "bold")))
+    print(f"  System Role Support : " + (paint("SUPPORTED", "green") if caps.get("sys_role") else paint("RESTRICTED (developer/user)", "yellow")))
+    print(f"  Function Calling    : " + (paint("NATIVE", "green") if caps.get("tools") else dim("Text parsing")))
+    print(f"  Metadata Source     : {caps.get('source')}")
+
+    if warnings:
+        print()
+        w_bar = "  ╭── ⚠️  CAPABILITY WARNING BAR ──────────────────────────────"
+        print(paint(w_bar, "yellow", "bold"))
+        for w in warnings:
+            print(paint(f"  │ {ICONS['warn']} {w}", "yellow"))
+        print(paint("  ╰──────────────────────────────────────────────────────────", "yellow", "bold"))
+    print()
+    return caps
+
+
 def apply_quirks(body: dict) -> dict:
     b = dict(body)
     if not STREAM_STATE.get("usage", True):
@@ -4128,6 +4471,15 @@ def apply_quirks(body: dict) -> dict:
         b.pop("temperature", None)
     if API_QUIRKS.get("no_reasoning_effort"):
         b.pop("reasoning_effort", None)
+
+    # Capability-driven parameter omission
+    model_name = b.get("model", "")
+    if model_name:
+        caps = probe_model_capabilities(model_name)
+        if not caps.get("custom_temp"):
+            b.pop("temperature", None)
+        if not caps.get("reasoning"):
+            b.pop("reasoning_effort", None)
     return b
 
 
@@ -4183,6 +4535,26 @@ def record_usage(usage, in_chars: int, out_chars: int) -> None:
         USAGE["out"] += out_chars // 4
 
 
+def prepare_cached_messages(messages: list) -> list:
+    """Optimize prompt prefix caching. Injects Anthropic cache_control breakpoints where supported."""
+    base = clean_base_url(CFG.get("base_url", "")).lower()
+    model = (CFG.get("model", "")).lower()
+    is_claude_or_openrouter = ("openrouter" in base or "anthropic" in base or "claude" in model)
+
+    prepared = []
+    for m in messages:
+        item = dict(m)
+        content = item.get("content")
+        # For Claude on OpenRouter or Anthropic, inject cache_control on system prompt and compaction checkpoints
+        if is_claude_or_openrouter and isinstance(content, str) and content:
+            if item.get("role") == "system" or "[PERSISTENT BRAIN MEMORY" in content:
+                item["content"] = [
+                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                ]
+        prepared.append(item)
+    return prepared
+
+
 def _request(body: dict):
     base = clean_base_url(CFG.get("base_url", DEFAULT_BASE_URL))
     url = base + "/chat/completions"
@@ -4196,6 +4568,10 @@ def _request(body: dict):
         "Accept": "text/event-stream" if body.get("stream") else "application/json",
         "User-Agent": "FlowCo/5.0 (Termux; Android)",
     }
+    if "openrouter" in base.lower() or "anthropic" in base.lower():
+        headers["HTTP-Referer"] = "https://github.com/Fearoki0/flowco-agent"
+        headers["X-Title"] = "FlowCo Agent"
+        headers["anthropic-beta"] = "prompt-caching-2024-07-31"
     return urllib.request.Request(url, data=data, headers=headers)
 
 
@@ -4235,7 +4611,7 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True, caller: st
 
     body = {
         "model": (CFG or {}).get("model", DEFAULT_MODEL),
-        "messages": messages,
+        "messages": prepare_cached_messages(messages),
         "temperature": float((CFG or {}).get("temperature", 0.2)),
         "max_tokens": int((CFG or {}).get("max_tokens", 8192)),
         "stream": True,
@@ -4258,8 +4634,9 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True, caller: st
         try:
             req = _request(body)
             with urllib.request.urlopen(req, timeout=120) as resp:
-                text_parts, calls, finish, usage = [], {}, None, None
+                text_parts, reasoning_parts, calls, finish, usage = [], [], {}, None, None
                 reasoning_active = [False]
+                reasoning_collapsed_shown = [False]
 
                 for raw in resp:
                     line = raw.decode("utf-8", "replace").strip()
@@ -4286,15 +4663,17 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True, caller: st
                             finish = choice["finish_reason"]
                         delta = choice.get("delta") or {}
 
-                        # Reasoning display
+                        # Reasoning display (supports Ctrl+O collapse / expand)
                         r_text = extract_reasoning(delta)
-                        if r_text and CFG.get("show_reasoning"):
-                            if not reasoning_active[0]:
-                                sys.stdout.write(paint("\n╭─ 🧠 Thinking Process ────────────────────────────────────────\n│ ", "magenta", "bold"))
-                                reasoning_active[0] = True
-                            formatted = r_text.replace("\n", "\n│ ")
-                            sys.stdout.write(dim(formatted))
-                            sys.stdout.flush()
+                        if r_text:
+                            reasoning_parts.append(r_text)
+                            if CFG.get("show_reasoning") and not CFG.get("collapse_thinking"):
+                                if not reasoning_active[0]:
+                                    sys.stdout.write(paint("\n╭─ 🧠 Thinking Process ────────────────────────────────────────\n│ ", "magenta", "bold"))
+                                    reasoning_active[0] = True
+                                formatted = r_text.replace("\n", "\n│ ")
+                                sys.stdout.write(dim(formatted))
+                                sys.stdout.flush()
 
                         piece = delta.get("content") or delta.get("text") or ""
                         if isinstance(piece, list):
@@ -4303,6 +4682,11 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True, caller: st
                             if reasoning_active[0]:
                                 sys.stdout.write(paint("\n╰─────────────────────────────────────────────────────────────\n\n", "magenta"))
                                 reasoning_active[0] = False
+                            elif reasoning_parts and CFG.get("collapse_thinking") and not reasoning_collapsed_shown[0]:
+                                tok_est = max(1, len("".join(reasoning_parts)) // 4)
+                                sys.stdout.write(paint(f"🧠 [Thinking: ~{tok_est} tokens collapsed — Ctrl+O or /thinking to toggle]\n", "magenta", "dim"))
+                                sys.stdout.flush()
+                                reasoning_collapsed_shown[0] = True
                             text_parts.append(piece)
                             sys.stdout.write(piece)
                             sys.stdout.flush()
@@ -4326,6 +4710,10 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True, caller: st
 
                 if reasoning_active[0]:
                     sys.stdout.write(paint("\n╰─────────────────────────────────────────────────────────────\n\n", "magenta"))
+                elif reasoning_parts and CFG.get("collapse_thinking") and not reasoning_collapsed_shown[0]:
+                    tok_est = max(1, len("".join(reasoning_parts)) // 4)
+                    sys.stdout.write(paint(f"🧠 [Thinking: ~{tok_est} tokens collapsed — Ctrl+O or /thinking to toggle]\n", "magenta", "dim"))
+                    sys.stdout.flush()
 
                 if text_parts:
                     sys.stdout.write("\n")
@@ -4439,7 +4827,7 @@ def chat_plain(messages, tool_choice="auto", caller: str = "main", tools: list =
 
     body = {
         "model": (CFG or {}).get("model", DEFAULT_MODEL),
-        "messages": messages,
+        "messages": prepare_cached_messages(messages),
         "temperature": float((CFG or {}).get("temperature", 0.2)),
         "max_tokens": int((CFG or {}).get("max_tokens", 8192)),
         "stream": False,
@@ -4522,31 +4910,36 @@ def with_workspace(text: str) -> str:
 
 
 def system_prompt() -> str:
-    prompt = f"""You are FlowCo v4.5, an autonomous, self-verifying, self-repairing AI software engineering and agentic platform running in Android Termux.
+    prompt = f"""You are FlowCo v5.0, an autonomous, self-verifying, intellectually rigorous AI software engineering and agentic platform running in Android Termux.
 
-OPERATIONAL METHODOLOGY (Strict Execution Loop):
-1. UNDERSTAND: Grasp the user goal thoroughly. Inspect existing project files before modifying them.
-2. PLAN & GRAPH: For complex tasks, structure execution using `task_graph(action='add', ...)` or `update_plan`.
-3. DELEGATE: For deep multi-file research, documentation surveys, or isolated diagnostics, spawn a specialized subagent using `spawn_subagent(role=..., task=...)` to keep main context concise.
-4. INSPECT: Read files (read_file), examine structure (list_files), inspect metadata (file_info), find definitions (search_files).
-5. DOWNLOAD & ACQUIRE: When asked to download files or repositories from the internet:
-   - For web URLs (HTTP/HTTPS): use `download_file` (supports streaming, redirects, auto-extraction of archives).
-   - For GitHub (repos, releases, files): use `github_download` (handles shallow clones, zipball fallbacks, raw files, and release assets).
-   - All downloaded assets are organized into the internal storage workplace folder ({WORK}/downloads and {WORK}/github).
-   - Always report the exact internal storage path (e.g., /storage/emulated/0/...) to the user.
-6. ARCHIVE & PACK: Create or unpack zip/tar archives using `archive` (action='extract' or 'pack').
-7. ASYNC & BACKGROUND: For long-running builds, downloads, or preview servers, use `run_background` and check with `task_status`.
-8. EXECUTE: Write complete files (write_file), make targeted diffs (edit_file), or run sandboxed commands (run_command).
-9. VERIFY: Autonomously prove the solution works using `verify(command=..., check_file=...)`. Do not complete without verification.
-10. LEARN: When you discover unique fixes, compiler flags, or Android quirks, persist them using `learn_skill(name=..., trigger=..., solution=...)`.
-11. COMPLETE: Provide a concise final report of changes, verification results, and exact file paths on internal storage.
+COGNITIVE METHODOLOGY & TASK ANALYSIS (Claude-Style Reasoning Engine):
+1. DEEP INTENT ANALYSIS & INTERPRETATION:
+   - Before taking action or invoking tools, thoroughly analyze what the user is really asking for.
+   - Look beneath literal phrasing: detect hidden intents, underlying architectural goals, and environmental context.
+   - Be robust to typos, phonetic or voice-to-text slips (e.g. "quotient" -> question, "cloed" -> Claude, "rcli" -> our CLI, "personal" -> persona), and colloquialisms without pedantic corrections. Infer the user's true technical meaning with precision.
+2. BOUNDARY DISCIPLINE & IMPOSSIBILITY RECOGNITION:
+   - If a request is technically, mathematically, or architecturally impossible (e.g. running incompatible binary architectures without emulation, accessing protected Android system directories without root, breaking cryptographic guarantees, or executing contradictory operations), establish clear, polite boundaries immediately.
+   - Clearly explain WHY it cannot be achieved as stated, and immediately propose viable, realistic alternatives. Never hallucinate false success, simulate nonexistent commands, or enter retry loops on impossible tasks.
+3. CLARIFICATION & INTERACTIVE INQUIRY (`ask_user`):
+   - When encountering severe ambiguity, missing critical parameters, broken dependencies, or architectural forks with meaningful trade-offs, do not make wild guesses.
+   - Use `ask_user(question=..., options=[...])` to ask the user directly, present clear choices, and proceed with their guidance.
+4. INSPECT BEFORE MODIFYING:
+   - Always read and examine existing files (`read_file`, `list_files`, `search_files`, `file_info`) before editing or overwriting.
+5. ISOLATED EXPERIMENTATION (`run_sandbox`):
+   - For temporary scripts, test algorithms, or exploratory commands, use `run_sandbox(command=..., script_code=...)`. Keep the primary workspace clean and preserve context history.
+6. SURGICAL EXECUTION:
+   - Write complete new files (`write_file`) or apply targeted diffs (`edit_file`). Never rewrite massive files when a single targeted edit suffices. Automated snapshot backups are created prior to every write.
+7. AUTONOMOUS VERIFICATION GATE (`verify`):
+   - Prove your solution works empirically. Execute test suites, validate process exit codes, and check file invariants. Never declare a task complete without verification.
+8. CONTINUOUS SKILL LEARNING (`learn_skill`):
+   - When discovering unique Termux fixes, compiler flags, or Android platform workarounds, persist them using `learn_skill`.
+9. DIRECT, PROFESSIONAL COMMUNICATION:
+   - Be direct, concise, and technically precise. Avoid conversational fluff or corporate apologies ("Certainly!", "I'd be happy to help!"). Always report the exact internal storage path ({WORK}) and verification proof to the user.
 
-STRICT CONSTRAINTS:
+STRICT INVARIANTS:
 - All operations are strictly constrained to the workplace: {WORK}
 - Never fabricate test outcomes, tool executions, or file edits.
-- Use targeted edit_file rather than full file rewrites for large files.
-- Snapshots are automatically taken before file writes/edits.
-- Do not expose raw chain-of-thought in final text."""
+- Snapshots are automatically taken before file writes/edits."""
 
     if TASK_GRAPH.get("order"):
         prompt += f"\n\nCURRENT TASK GRAPH:\n{tool_task_graph('show')}\n"
@@ -4583,9 +4976,9 @@ def slim_history(messages) -> None:
             m["content"] = clip(m["content"], 1000)
 
 
-def compact(messages) -> None:
-    """Summarize older messages while preserving system prompt, plan, and recent turns."""
-    if len(messages) <= KEEP_FULL + 2:
+def compact(messages, force: bool = False) -> None:
+    """Summarize older messages into a persistent brain memory anchor, preserving system prompt and recent turns."""
+    if len(messages) <= KEEP_FULL + 2 and not force:
         return
 
     system_msg = messages[0]
@@ -4593,28 +4986,68 @@ def compact(messages) -> None:
     middle = messages[1:-KEEP_FULL]
 
     summary_items = []
+    decisions_found = []
+    files_touched = set()
+    verified_found = []
+
     for m in middle:
         role = m.get("role")
+        content_str = str(m.get("content") or "")
         if role == "tool":
-            summary_items.append("Tool result: " + clip(str(m.get("content") or ""), 120))
+            summary_items.append("Tool result: " + clip(content_str, 120))
+            if "PASS" in content_str or "success" in content_str.lower():
+                verified_found.append(clip(content_str, 80))
         elif role == "user":
-            summary_items.append("User requested: " + clip(str(m.get("content") or ""), 150))
+            summary_items.append("User requested: " + clip(content_str, 150))
         elif role == "assistant" and m.get("tool_calls"):
             names = [tc["function"]["name"] for tc in m["tool_calls"] if "function" in tc]
             summary_items.append("Agent called: " + ", ".join(names))
+            for tc in m["tool_calls"]:
+                try:
+                    args = parse_args(tc.get("function", {}).get("arguments", "{}"))
+                    if "path" in args:
+                        files_touched.add(str(args["path"]))
+                    elif "src" in args:
+                        files_touched.add(str(args["src"]))
+                except Exception:
+                    pass
+
+    # Persist brain state into .flowco/memory.json and .flowco/MEMORY.md
+    for f in files_touched:
+        update_brain_memory(file_touched=str(f), note="referenced in conversation")
+    for v in verified_found[-5:]:
+        update_brain_memory(verified=v)
+    if PLAN.get("text"):
+        update_brain_memory(plan=PLAN["text"])
+
+    mem = load_brain_memory()
+
+    anchor_lines = [
+        "🧠 [PERSISTENT BRAIN MEMORY & CONTEXT COMPACT ANCHOR]",
+        f"Goal: {CURRENT.get('request') or mem.get('task_goal') or 'Active agent session'}",
+        f"Last Compact: {now_stamp()}",
+    ]
+    if mem.get("decisions"):
+        anchor_lines.append("Key Decisions: " + "; ".join(mem["decisions"][-5:]))
+    if files_touched:
+        anchor_lines.append("Active Files: " + ", ".join(sorted(files_touched)[:10]))
+    if mem.get("verified_facts"):
+        anchor_lines.append("Verified Ground Truths: " + "; ".join(mem["verified_facts"][-5:]))
+    if PLAN.get("text"):
+        anchor_lines.append(f"Active Plan: {PLAN['text']}")
+    if summary_items:
+        anchor_lines.append("Recent Progress Summary:\n" + "\n".join("- " + s for s in summary_items[-15:]))
 
     checkpoint = {
         "role": "user",
-        "content": "[CONTEXT COMPACTION CHECKPOINT]\nSummary of earlier progress:\n"
-        + "\n".join("- " + s for s in summary_items[-20:])
-        + (f"\nActive Plan: {PLAN['text']}" if PLAN.get("text") else "")
+        "content": "\n".join(anchor_lines)
     }
 
     messages.clear()
     messages.append(system_msg)
     messages.append(checkpoint)
-    messages.extend(recent)
-    ok("Context compacted successfully.")
+    messages.extend(recent[-4:] if len(recent) > 4 else recent)
+    ok(f"Context compacted into persistent brain anchor (retained {len(messages)} messages).")
 
 
 # ===========================================================================
@@ -4698,6 +5131,18 @@ def clean_args(name: str, args: dict) -> dict:
             c["command"] = c.pop("cmd")
         if "file" in c and "check_file" not in c:
             c["check_file"] = c.pop("file")
+    elif name == "ask_user":
+        if "prompt" in c and "question" not in c:
+            c["question"] = c.pop("prompt")
+        if "choices" in c and "options" not in c:
+            c["options"] = c.pop("choices")
+    elif name == "run_sandbox":
+        if "cmd" in c and "command" not in c:
+            c["command"] = c.pop("cmd")
+        if "code" in c and "script_code" not in c:
+            c["script_code"] = c.pop("code")
+        if "file" in c and "script_name" not in c:
+            c["script_name"] = c.pop("file")
     elif name == "learn_skill":
         if "title" in c and "name" not in c:
             c["name"] = c.pop("title")
@@ -4784,6 +5229,14 @@ def run_turn(messages, task: str = None) -> None:
                     warn(f"Approaching task budget: {total_tokens:,}/{curr_b:,} tokens used ({warn_pct}%).")
                     CURRENT["warned_budget"] = True
 
+            # Auto-compaction check (150k / 250k token threshold into brain memory anchor)
+            auto_compact_limit = int(CFG.get("auto_compact_tokens", 150000))
+            if auto_compact_limit > 0 and len(messages) > KEEP_FULL + 2:
+                est_ctx_tokens = sum(_msg_size(m) for m in messages) // 4
+                if est_ctx_tokens >= auto_compact_limit:
+                    info(f"🧠 Context reached {est_ctx_tokens:,} tokens (>= {auto_compact_limit:,} limit). Auto-compacting into persistent brain anchor...")
+                    compact(messages, force=True)
+
             slim_history(messages)
 
             w = max(40, min(term_width(), 76))
@@ -4821,15 +5274,21 @@ def run_turn(messages, task: str = None) -> None:
                 raw_args = fn_info.get("arguments", "{}")
                 args = clean_args(fn_name, parse_args(raw_args))
 
-                # Loop detection
+                # Loop detection & read thrashing circuit breaker
                 call_sig = (fn_name, json.dumps(args, sort_keys=True))
                 recent_calls.append(call_sig)
+                read_only_tools = {"read_file", "list_files", "search_files", "file_info"}
                 if len(recent_calls) >= 3 and recent_calls[-1] == recent_calls[-2] == recent_calls[-3]:
                     warn(f"Repetitive call detected for {fn_name}. Breaking loop.")
                     tool_output = "Error: Repeated identical tool call without progress. Try a different approach."
+                elif len(recent_calls) >= 5 and all(c[0] in read_only_tools for c in recent_calls[-5:]) and not TASK_STATE["touches"]:
+                    warn("Token burn circuit breaker: 5 consecutive read queries with no file modifications.")
+                    tool_output = "System Advisory: You have performed 5 consecutive read-only inspections without modifying files or updating the plan. Either take concrete action (write_file, edit_file, run_sandbox, verify) or synthesize your findings to conclude."
                 elif fn_name in TOOL_FUNCS:
                     summary_args = clip(json.dumps(args, ensure_ascii=False), 50)
-                    print(paint(f"  ┌── {ICONS['bolt']} {fn_name}", "cyan", "bold") + dim(f"({summary_args})"))
+                    collapsed = bool(CFG.get("collapse_thinking"))
+                    if not collapsed:
+                        print(paint(f"  ┌── {ICONS['bolt']} {fn_name}", "cyan", "bold") + dim(f"({summary_args})"))
                     set_tmux_title(f"[{fn_name}] {clip(json.dumps(args), 25)}", f"FlowCo:{fn_name}")
                     t0 = time.time()
                     try:
@@ -4844,11 +5303,18 @@ def run_turn(messages, task: str = None) -> None:
 
                     if is_error(tool_output):
                         TASK_STATE["errors"] += 1
-                        print(paint(f"  └── {ICONS['cross']} Error ({dt:.2f}s)", "red", "bold"))
                         err_preview = str(tool_output).splitlines()[0] if str(tool_output) else "Error"
-                        print(paint(f"      {clip(err_preview, 72)}", "red"))
+                        if collapsed:
+                            print(paint(f"  [{ICONS['cross']} {fn_name} failed ({dt:.2f}s)]: {clip(err_preview, 60)}", "red"))
+                        else:
+                            print(paint(f"  └── {ICONS['cross']} Error ({dt:.2f}s)", "red", "bold"))
+                            print(paint(f"      {clip(err_preview, 72)}", "red"))
                     else:
-                        print(paint(f"  └── {ICONS['check']} Success ({dt:.2f}s)", "green", "bold"))
+                        if collapsed:
+                            res_preview = str(tool_output).strip().splitlines()[0] if str(tool_output).strip() else "done"
+                            print(paint(f"  [{ICONS['check']} {fn_name} ({dt:.2f}s)]", "green") + dim(f" -> {clip(res_preview, 45)}"))
+                        else:
+                            print(paint(f"  └── {ICONS['check']} Success ({dt:.2f}s)", "green", "bold"))
                 else:
                     tool_output = f"Error: unknown tool '{fn_name}'."
 
@@ -5209,7 +5675,7 @@ def cmd_help(category: str = "") -> None:
             ("/apipro [switch <name>]", "Open provider manager or switch profiles"),
             ("/local [use <preset>]", "Scan & auto-switch to local models (Ollama, llama.cpp, LM Studio, vLLM)"),
             ("/models [filter]", "Fetch and list available models from endpoint"),
-            ("/model <id>", "Set active model ID"),
+            ("/model <id>", "Set active model ID & probe capability matrix/warnings"),
             ("/coder [model|off]", "Configure secondary coder model"),
             ("/testapi", "Test active provider latency and connectivity"),
             ("/stream-test [prompt]", "Benchmark real-time SSE token streaming from provider"),
@@ -5217,6 +5683,7 @@ def cmd_help(category: str = "") -> None:
         ("Reasoning & Thought", [
             ("/effort [level]", "Set reasoning effort (off|low|med|high|xhigh|max|auto)"),
             ("/think [level]", "Alias for /effort"),
+            ("/thinking [toggle|on|off]", "Toggle collapse of thinking & execution verbosity (Ctrl+O)"),
         ]),
         ("Code & Project Tools", [
             ("/files [path]", "List files in workspace"),
@@ -5242,8 +5709,9 @@ def cmd_help(category: str = "") -> None:
             ("/export [file]", "Export conversation transcript to markdown"),
         ]),
         ("System & Maintenance", [
+            ("/settings [set|reset|show]", "Interactive configuration panel for all CLI & terminal settings"),
             ("/status", "Display complete agent system status"),
-            ("/sandbox [local|proot|off|auto]", "Inspect or configure command sandbox isolation"),
+            ("/sandbox [isolated|local|proot|off|auto]", "Inspect or configure command sandbox isolation"),
             ("/doctor", "Run local diagnostics on environment and permissions"),
             ("/logs [n]", "View recent events from flowco.log"),
             ("/clear", "Clear console screen and re-render header"),
@@ -5388,20 +5856,22 @@ def cmd_sandbox(arg: str = "") -> None:
     parts = (arg or "").strip().split()
     if parts:
         sub = parts[0].lower()
-        if sub in ("local", "proot", "off", "auto"):
+        if sub in ("local", "isolated", "proot", "off", "auto"):
             CFG["sandbox"] = sub
             save_config()
             setup_sandbox()
             if sub == "local":
                 warn("Restricted local execution enabled.")
                 print(dim("  Note: No OS container isolation; path boundary guards are active."))
+            elif sub == "isolated":
+                ok("Dedicated workspace sandbox (.sandbox/) enabled with sanitized environment.")
             else:
                 ok(f"Sandbox mode set to: {sub} ({SANDBOX.get('note', '')})")
         else:
-            err("Usage: /sandbox [local|proot|off|auto]")
+            err("Usage: /sandbox [isolated|local|proot|off|auto]")
     else:
         info(f"Current sandbox mode: {SANDBOX.get('mode')} - {SANDBOX.get('note')}")
-        print(dim("  Options: /sandbox local, /sandbox proot, /sandbox off, /sandbox auto\n"))
+        print(dim("  Options: /sandbox isolated, /sandbox local, /sandbox proot, /sandbox off, /sandbox auto\n"))
 
 
 def scan_local_models() -> dict:
@@ -5596,14 +6066,14 @@ def cmd_doctor() -> None:
 
 
 def cmd_memory() -> None:
-    """Display active plan and project context state."""
-    section("Agent Memory & Context")
+    """Display active plan, session state, and persistent brain memory."""
+    section("Agent Memory & Brain State")
     if PLAN.get("text"):
         print(bold(f"  Active Plan (Version {PLAN['version']}):"))
         for line in PLAN["text"].splitlines():
             print("    " + dim("| ") + line)
     else:
-        print(dim("  No execution plan recorded for this task."))
+        print(dim("  No active execution plan recorded for this task."))
 
     print()
     if TASK_STATE["touches"]:
@@ -5611,8 +6081,142 @@ def cmd_memory() -> None:
         for f in sorted(TASK_STATE["touches"]):
             print("    - " + f)
     else:
-        print(dim("  No files touched yet."))
+        print(dim("  No files touched yet this session."))
+
+    mem = load_brain_memory()
     print()
+    print(bold("  🧠 Persistent Brain Memory (.flowco/memory.json):"))
+    print(f"    Last Updated  : {mem.get('last_updated') or '(none)'}")
+    print(f"    Current Goal  : {mem.get('task_goal') or '(none)'}")
+    if mem.get("decisions"):
+        print(bold("    Key Architectural Decisions:"))
+        for d in mem["decisions"][-5:]:
+            print(f"      - {d}")
+    if mem.get("verified_facts"):
+        print(bold("    Verified Ground Truths:"))
+        for v in mem["verified_facts"][-5:]:
+            print(f"      - [PASS] {v}")
+    if mem.get("touched_files"):
+        print(bold("    Historical Touched Files:"))
+        for tf, note_str in list(mem["touched_files"].items())[-8:]:
+            print(f"      - {tf} ({note_str})")
+    print()
+
+
+def cmd_thinking(arg: str = "") -> None:
+    """Toggle or set thinking & execution verbosity collapse state."""
+    choice = (arg or "").strip().lower()
+    if choice in ("on", "1", "true", "collapse", "hide"):
+        CFG["collapse_thinking"] = True
+    elif choice in ("off", "0", "false", "expand", "show"):
+        CFG["collapse_thinking"] = False
+    else:
+        CFG["collapse_thinking"] = not bool(CFG.get("collapse_thinking", False))
+    save_config()
+    state = "COLLAPSED (compact badges)" if CFG["collapse_thinking"] else "EXPANDED (live streaming)"
+    ok(f"Thinking & execution verbosity: {state} (shortcut: Ctrl+O)")
+
+
+def cmd_settings(arg: str = "") -> None:
+    """Interactive and command-driven settings configuration panel."""
+    sub = (arg or "").strip()
+    parts = sub.split(None, 2)
+    action = parts[0].lower() if parts else ""
+
+    if action == "set" and len(parts) >= 3:
+        key, val_str = parts[1], parts[2]
+        allowed_keys = set(SHARED_DEFAULTS.keys()) | {"model", "coder_model", "temperature", "max_tokens"}
+        if key not in allowed_keys:
+            err(f"Unknown setting '{key}'. Run '/settings' to see all configurable options.")
+            return
+
+        curr_val = CFG.get(key, SHARED_DEFAULTS.get(key))
+        if isinstance(curr_val, bool) or key in ("collapse_thinking", "show_reasoning", "tool_routing", "stream"):
+            val = val_str.lower() in ("true", "1", "yes", "on", "enable")
+        elif isinstance(curr_val, int) or key in ("max_steps", "cmd_timeout", "auto_compact_tokens", "task_token_budget", "session_token_budget", "warn_at_budget_pct", "backup_keep", "max_tokens"):
+            try:
+                val = int(val_str)
+            except ValueError:
+                err(f"Value for '{key}' must be an integer.")
+                return
+        elif isinstance(curr_val, float) or key == "temperature":
+            try:
+                val = float(val_str)
+            except ValueError:
+                err(f"Value for '{key}' must be a float.")
+                return
+        else:
+            val = val_str
+
+        CFG[key] = val
+        save_config()
+
+        if key == "sandbox":
+            setup_sandbox()
+        elif key == "coder_model":
+            global TOOLS
+            TOOLS = build_tools()
+
+        ok(f"Setting '{key}' updated to: {val}")
+        return
+
+    elif action in ("reset", "default"):
+        target = parts[1] if len(parts) > 1 else ""
+        if target:
+            if target in SHARED_DEFAULTS:
+                CFG[target] = SHARED_DEFAULTS[target]
+                save_config()
+                ok(f"Reset '{target}' to default ({SHARED_DEFAULTS[target]}).")
+            else:
+                err(f"Unknown setting '{target}'.")
+        else:
+            for k, v in SHARED_DEFAULTS.items():
+                CFG[k] = v
+            save_config()
+            ok("All shared CLI settings reset to defaults.")
+        return
+
+    elif action in ("json", "show"):
+        print(json.dumps(CFG, indent=2, ensure_ascii=False))
+        return
+
+    print()
+    section("FlowCo Configuration & Terminal Settings")
+    print(dim("  Manage via: /settings set <key> <val>  |  /settings reset [key]"))
+    print()
+
+    groups = [
+        ("🖥️  Terminal & Interface Settings", [
+            ("collapse_thinking", "Collapse reasoning & tool logs (Ctrl+O)", CFG.get("collapse_thinking", False)),
+            ("show_reasoning", "Parse & display thinking tokens", CFG.get("show_reasoning", True)),
+            ("theme", "Terminal color theme", CFG.get("theme", "default")),
+            ("cmd_timeout", "Command timeout (seconds)", CFG.get("cmd_timeout", 120)),
+        ]),
+        ("🛡️  Execution & Sandbox Settings", [
+            ("sandbox", "Sandbox isolation mode (auto/isolated/local/off)", CFG.get("sandbox", "auto")),
+            ("max_steps", "Maximum autonomous steps per task", CFG.get("max_steps", 40)),
+            ("backup_keep", "File snapshot backups retained", CFG.get("backup_keep", 20)),
+        ]),
+        ("🧠  Compaction & Token Budget Settings", [
+            ("auto_compact_tokens", "Auto-compact threshold into brain anchor", f"{int(CFG.get('auto_compact_tokens', 150000)):,} tokens"),
+            ("task_token_budget", "Task token budget limit (0 = none)", f"{int(CFG.get('task_token_budget', 250000)):,} tokens"),
+            ("session_token_budget", "Session token budget limit (0 = none)", f"{int(CFG.get('session_token_budget', 0)):,} tokens"),
+            ("warn_at_budget_pct", "Budget exhaustion warning trigger", f"{CFG.get('warn_at_budget_pct', 80)}%"),
+        ]),
+        ("🤖  Active Model & Engine Settings", [
+            ("model", "Primary LLM Model ID", CFG.get("model", "-")),
+            ("temperature", "Sampling temperature", CFG.get("temperature", 0.2)),
+            ("max_tokens", "Response max output tokens", CFG.get("max_tokens", 8192)),
+            ("coder_model", "Dedicated coder model ID", CFG.get("coder_model") or "off"),
+        ]),
+    ]
+
+    for g_title, items in groups:
+        print(bold(f"  {g_title}"))
+        for key, desc, val in items:
+            val_str = paint("True", "green", "bold") if val is True else (paint("False", "yellow") if val is False else str(val))
+            print(f"    %-22s : %-18s " % (key, val_str) + dim(f"({desc})"))
+        print()
 
 
 def cmd_logs(lines: int = 30) -> None:
@@ -6023,7 +6627,7 @@ def setup_readline() -> None:
     try:
         import readline
         commands = [
-            "/help", "/status", "/stream-test", "/tasks", "/bg", "/skills",
+            "/help", "/status", "/settings", "/thinking", "/stream-test", "/tasks", "/bg", "/skills",
             "/doctor", "/testapi", "/undo", "/files", "/download", "/github",
             "/workspace", "/workplace", "/local", "/apipro", "/models", "/model",
             "/coder", "/effort", "/think", "/budget", "/cost", "/memory",
@@ -6072,6 +6676,7 @@ try:
     from prompt_toolkit.formatted_text import HTML
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.key_binding import KeyBindings
     PROMPT_TOOLKIT_AVAILABLE = True
 except Exception:
     PROMPT_TOOLKIT_AVAILABLE = False
@@ -6091,7 +6696,7 @@ def ensure_prompt_toolkit() -> bool:
             check=False,
         )
         if res.returncode == 0:
-            global PromptSession, Completer, Completion, CompleteStyle, Style, HTML, FileHistory, AutoSuggestFromHistory
+            global PromptSession, Completer, Completion, CompleteStyle, Style, HTML, FileHistory, AutoSuggestFromHistory, KeyBindings
             import prompt_toolkit
             from prompt_toolkit import PromptSession
             from prompt_toolkit.completion import Completer, Completion
@@ -6100,6 +6705,7 @@ def ensure_prompt_toolkit() -> bool:
             from prompt_toolkit.formatted_text import HTML
             from prompt_toolkit.history import FileHistory
             from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+            from prompt_toolkit.key_binding import KeyBindings
             PROMPT_TOOLKIT_AVAILABLE = True
             return True
     except Exception:
@@ -6114,6 +6720,7 @@ class FlowCoSlashCompleter(_BASE_COMPLETER):
     """Interactive slash-command completer with live dropdown descriptions and path completion."""
     COMMANDS = [
         ('/help', 'Show commands, capabilities & guide'),
+        ('/settings', 'Configure CLI, terminal, budget & sandbox settings'),
         ('/status', 'Show workspace, tokens & budget'),
         ('/stream-test', 'Benchmark real-time token streaming'),
         ('/testapi', 'Quick ping test of active provider'),
@@ -6129,8 +6736,9 @@ class FlowCoSlashCompleter(_BASE_COMPLETER):
         ('/github', 'Clone or download GitHub repo/assets'),
         ('/workspace', 'Switch workspace directory'),
         ('/models', 'Fetch available models from provider'),
-        ('/model', 'Switch active LLM model ID'),
+        ('/model', 'Switch active LLM model ID & inspect capabilities'),
         ('/coder', 'Set dedicated coder LLM model'),
+        ('/thinking', 'Toggle collapse/expand of thinking process & verbose outputs (Ctrl+O)'),
         ('/think', 'Adjust reasoning effort (none/med/high)'),
         ('/budget', 'Set or inspect token budget limit'),
         ('/cost', 'View token count & estimated dollar cost'),
@@ -6215,11 +6823,25 @@ def get_prompt_session():
             'scrollbar.button': 'bg:#45475a',
         })
 
+        kb = KeyBindings()
+
+        @kb.add("c-o")
+        def _handle_ctrl_o(event):
+            """Toggle collapse / expand of thinking process and task outputs."""
+            curr = bool(CFG.get("collapse_thinking", False))
+            CFG["collapse_thinking"] = not curr
+            save_config()
+            state = "COLLAPSED" if CFG["collapse_thinking"] else "EXPANDED"
+            print(paint(f"\n🧠 Thinking & Execution Verbosity: {state} (press Ctrl+O to toggle)\n", "magenta", "bold"), flush=True)
+            if hasattr(event, "app") and hasattr(event.app, "renderer"):
+                event.app.renderer.erase()
+
         _PROMPT_SESSION = PromptSession(
             history=hist,
             auto_suggest=AutoSuggestFromHistory(),
             style=style,
             completer=FlowCoSlashCompleter(),
+            key_bindings=kb,
             complete_while_typing=True,
             complete_style=CompleteStyle.COLUMN,
         )
@@ -6243,8 +6865,9 @@ def get_user_input() -> str:
                     tok_str += f"/{budget:,}"
                 bg_alive = len([t for t in BACKGROUND_TASKS.values() if t.get("proc") and t["proc"].poll() is None])
                 bg_str = f" │ ⚙ {bg_alive} bg" if bg_alive else ""
+                t_mode = " [🧠 Hide]" if CFG.get("collapse_thinking") else ""
                 return HTML(
-                    f" <b>[{m_label}]</b> │ <b>📂 {ws_label}</b> │ {tok_str}{bg_str} │ <i>/: commands</i> │ <i>Tab/Enter: select</i> │ <i>Ctrl+C: cancel</i> "
+                    f" <b>[{m_label}]</b>{t_mode} │ <b>📂 {ws_label}</b> │ {tok_str}{bg_str} │ <i>Ctrl+O: toggle think</i> │ <i>/: commands</i> "
                 )
             except Exception:
                 return HTML(" <b>FlowCo</b> │ <i>/: commands</i> │ <i>Tab/Enter: select</i> ")
@@ -6417,8 +7040,17 @@ def main() -> None:
                 CFG["model"] = parts[1].strip()
                 save_config()
                 ok(f"Model updated to: {CFG['model']}")
+                show_model_capability_card(CFG["model"])
             else:
-                info(f"Current model: {CFG.get('model')}")
+                show_model_capability_card(CFG.get("model"))
+            continue
+        elif cmd.startswith("/thinking") or cmd.startswith("/collapse"):
+            parts = user.split(None, 1)
+            cmd_thinking(parts[1] if len(parts) > 1 else "")
+            continue
+        elif cmd.startswith("/settings") or cmd.startswith("/setting") or cmd.startswith("/config"):
+            parts = user.split(None, 1)
+            cmd_settings(parts[1] if len(parts) > 1 else "")
             continue
         elif cmd.startswith("/coder"):
             parts = user.split(None, 1)
