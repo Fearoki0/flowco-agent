@@ -32,6 +32,7 @@ Usage:
   python flowco.py --doctor       # Local environment and storage diagnostics
 """
 
+import ast
 import atexit
 import difflib
 import getpass
@@ -74,7 +75,7 @@ except Exception:
 # ===========================================================================
 
 APP_NAME = "FlowCo"
-APP_VERSION = "4.5"
+APP_VERSION = "5.0"
 
 HOME = Path.home()
 
@@ -139,13 +140,16 @@ SHARED_DEFAULTS = {
     "proot_distro": "ubuntu",
     "max_steps": 40,
     "cmd_timeout": 120,
-    "confirm_commands": False,
+    "confirm_commands": True,        # FlowCo v5.0: default to True for safety
     "temperature": 0.2,
     "max_tokens": 8192,
     "stream": True,
     "show_reasoning": True,
     "context_budget_chars": 30000,
     "task_token_budget": 250000,     # 0 = unlimited
+    "session_token_budget": 0,       # 0 = unlimited
+    "max_subagent_requests": 15,
+    "max_retries": 3,
     "warn_at_budget_pct": 80,        # warn once at this percent of the budget
     "coder_model": "",
     "coder_base_url": "",
@@ -164,6 +168,7 @@ PROFILE_DEFAULTS = {
     "supports_reasoning": None,      # None=unknown, True, False
     "price_in_per_m": 0.0,
     "price_out_per_m": 0.0,
+    "price_cache_read_per_m": 0.0,
 }
 
 PROVIDER_PRESETS = {
@@ -202,7 +207,40 @@ PROVIDER_PRESETS = {
         "base_url": "http://127.0.0.1:11434/v1",
         "default_model": "qwen2.5-coder",
     },
+    "llamacpp": {
+        "label": "llama.cpp server (Local)",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "default_model": "default",
+    },
+    "lmstudio": {
+        "label": "LM Studio (Local)",
+        "base_url": "http://127.0.0.1:1234/v1",
+        "default_model": "default",
+    },
+    "vllm": {
+        "label": "vLLM / LocalAI (Local)",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "default_model": "default",
+    },
+    "local": {
+        "label": "Generic Local Model (127.0.0.1:8080)",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "default_model": "default",
+    },
 }
+
+
+def is_local_endpoint(url: str) -> bool:
+    """Return True if base_url points to a local on-device or loopback server."""
+    u = (url or "").lower()
+    return any(h in u for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1"))
+
+
+def has_valid_credentials() -> bool:
+    """Return True if an API key is configured or the active provider is a local server."""
+    if (CFG or {}).get("api_key"):
+        return True
+    return is_local_endpoint((CFG or {}).get("base_url", ""))
 
 _NUMERIC_KEYS = {
     "max_steps": (int, 1, 500),
@@ -212,6 +250,9 @@ _NUMERIC_KEYS = {
     "coder_max_tokens": (int, 1, 100000),
     "context_budget_chars": (int, 4000, 1000000),
     "task_token_budget": (int, 0, 100_000_000),
+    "session_token_budget": (int, 0, 1_000_000_000),
+    "max_subagent_requests": (int, 1, 100),
+    "max_retries": (int, 0, 10),
     "warn_at_budget_pct": (int, 1, 100),
     "backup_keep": (int, 1, 500),
 }
@@ -254,7 +295,7 @@ TASK_STATE = {
 }
 LAST_HTML = {"path": ""}
 
-# Protected wipe targets: never allow destructive actions on these paths
+# Protected wipe targets & Android system folders
 PROTECTED_WIPE_TARGETS = (
     Path("/"),
     HOME,
@@ -264,7 +305,256 @@ PROTECTED_WIPE_TARGETS = (
     Path("/system"),
     Path("/data"),
     Path("/etc"),
+    Path(os.environ.get("PREFIX", "/data/data/com.termux/files/usr")),
 )
+
+PROTECTED_ANDROID_NAMES = {
+    "dcim", "download", "downloads", "documents", "pictures",
+    "music", "movies", "android", "alarms", "notifications",
+    "ringtones", "podcasts", "audiobooks", ".android_secure"
+}
+
+
+# ===========================================================================
+# Centralized Token & Request Budget Supervisor (FlowCo v5.0)
+# ===========================================================================
+
+def normalize_usage(usage, in_chars: int = 0, out_chars: int = 0) -> tuple:
+    """Normalize usage metadata across provider schemas. Returns (pt, ct, cached, is_est)."""
+    if isinstance(usage, dict) and (usage.get("prompt_tokens") is not None or usage.get("input_tokens") is not None):
+        details = usage.get("prompt_tokens_details") or {}
+        cached = int(
+            details.get("cached_tokens")
+            or usage.get("cache_read_input_tokens")
+            or usage.get("prompt_cache_hit_tokens")
+            or usage.get("cached_tokens")
+            or 0
+        )
+        pt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        return pt, ct, cached, False
+    pt = max(1, in_chars // 4) if in_chars else 0
+    ct = max(1, out_chars // 4) if out_chars else 0
+    return pt, ct, 0, True
+
+
+def calculate_cost(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0, rates: dict = None) -> float:
+    """Calculate monetary dollar cost from token counts and provider profile pricing rates."""
+    r = rates or {}
+    p_in = float(r.get("price_in_per_m", 0.0) or 0.0)
+    p_out = float(r.get("price_out_per_m", 0.0) or 0.0)
+    p_cached = float(r.get("price_cache_read_per_m", 0.0) or 0.0)
+    regular_in = max(0, prompt_tokens - cached_tokens) if (cached_tokens and p_cached) else prompt_tokens
+    cost = (regular_in / 1e6 * p_in) + (completion_tokens / 1e6 * p_out)
+    if cached_tokens and p_cached:
+        cost += (cached_tokens / 1e6 * p_cached)
+    return cost
+
+
+class BudgetManager:
+    """Centralized token and request budget supervisor for FlowCo v5.0.
+
+    Enforces task-level and session-level spending limits across all model-calling paths:
+    main agent, subagents, coder model, streaming benchmarks, and diagnostic pings.
+    """
+    def __init__(self):
+        self.reset_session()
+
+    def reset_session(self):
+        self.session_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "estimated_tokens": 0,
+            "requests": 0,
+            "requests_success": 0,
+            "requests_failed": 0,
+            "retries": 0,
+            "subagent_requests": 0,
+            "subagent_tokens": 0,
+            "coder_requests": 0,
+            "coder_tokens": 0,
+            "diagnostic_requests": 0,
+            "diagnostic_tokens": 0,
+            "started_at": time.time(),
+        }
+        self.provider_usage = {}   # profile_name -> {in, out, cached, calls, est}
+        self.task_usage = {
+            "task_id": "",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "estimated_tokens": 0,
+            "requests": 0,
+            "retries": 0,
+            "subagent_requests": 0,
+            "subagent_tokens": 0,
+            "coder_requests": 0,
+            "coder_tokens": 0,
+            "diagnostic_requests": 0,
+            "diagnostic_tokens": 0,
+            "started_at": time.time(),
+            "budget": 250000,
+            "warned_budget": False,
+            "paused": False,
+        }
+
+    def start_task(self, task_id: str, budget: int = 0):
+        """Initialize fresh task accounting without wiping session or provider records."""
+        default_b = int(CFG.get("task_token_budget", 250000)) if CFG else 250000
+        task_b = int(budget) if budget > 0 else default_b
+        self.task_usage = {
+            "task_id": task_id,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "estimated_tokens": 0,
+            "requests": 0,
+            "retries": 0,
+            "subagent_requests": 0,
+            "subagent_tokens": 0,
+            "coder_requests": 0,
+            "coder_tokens": 0,
+            "diagnostic_requests": 0,
+            "diagnostic_tokens": 0,
+            "started_at": time.time(),
+            "budget": task_b,
+            "warned_budget": False,
+            "paused": False,
+        }
+
+    def total_task_tokens(self) -> int:
+        t = self.task_usage
+        return t["prompt_tokens"] + t["completion_tokens"]
+
+    def total_session_tokens(self) -> int:
+        s = self.session_usage
+        return s["prompt_tokens"] + s["completion_tokens"]
+
+    def remaining_task_budget(self) -> int:
+        b = self.task_usage.get("budget", 0)
+        if b <= 0:
+            return 10**9
+        return max(0, b - self.total_task_tokens())
+
+    def check_pre_request(self, estimated_tokens: int = 1000, is_subagent: bool = False, caller: str = "main") -> tuple:
+        """Pre-request gate check. Returns (allowed: bool, reason: str)."""
+        b = self.task_usage.get("budget", 0)
+        current = self.total_task_tokens()
+        if b > 0 and (current + estimated_tokens) > b:
+            self.task_usage["paused"] = True
+            TASK_STATE["paused"] = True
+            return (
+                False,
+                f"Task token budget exceeded ({current:,}/{b:,} tokens used). "
+                f"Request needs ~{estimated_tokens:,} tokens. "
+                f"Run '/budget add <amount>' (e.g. /budget add 50000) to extend allowance."
+            )
+
+        session_limit = int(CFG.get("session_token_budget", 0)) if CFG else 0
+        if session_limit > 0 and (self.total_session_tokens() + estimated_tokens) > session_limit:
+            return (
+                False,
+                f"Session token limit reached ({self.total_session_tokens():,}/{session_limit:,} tokens)."
+            )
+
+        if is_subagent:
+            max_sub_req = int(CFG.get("max_subagent_requests", 15)) if CFG else 15
+            if self.task_usage["subagent_requests"] >= max_sub_req:
+                return (
+                    False,
+                    f"Subagent request limit reached ({max_sub_req} requests allowed per task)."
+                )
+
+        return (True, "OK")
+
+    def record_request_start(self, caller: str = "main"):
+        self.session_usage["requests"] += 1
+        if caller != "diagnostic":
+            self.task_usage["requests"] += 1
+        if caller == "subagent":
+            self.session_usage["subagent_requests"] += 1
+            self.task_usage["subagent_requests"] += 1
+        elif caller == "coder":
+            self.session_usage["coder_requests"] += 1
+            self.task_usage["coder_requests"] += 1
+        elif caller == "diagnostic":
+            self.session_usage["diagnostic_requests"] += 1
+            self.task_usage["diagnostic_requests"] += 1
+
+    def record_retry(self):
+        self.session_usage["retries"] += 1
+        self.task_usage["retries"] += 1
+
+    def record_success(self, usage: dict = None, in_chars: int = 0, out_chars: int = 0, caller: str = "main", provider: str = "", prompt_tokens: int = 0, completion_tokens: int = 0, cached_tokens: int = 0, is_est: bool = False, **kwargs):
+        self.session_usage["requests_success"] += 1
+        prov_key = provider or (active_provider_name() if "active_provider_name" in globals() else "default")
+        prov_stats = self.provider_usage.setdefault(prov_key, {
+            "in": 0, "out": 0, "cached": 0, "calls": 0, "est": 0
+        })
+        prov_stats["calls"] += 1
+
+        if prompt_tokens or completion_tokens or cached_tokens:
+            pt, ct, cached, is_est = prompt_tokens, completion_tokens, cached_tokens, is_est
+        else:
+            pt, ct, cached, is_est = normalize_usage(usage, in_chars, out_chars)
+
+        if caller != "diagnostic":
+            self.task_usage["prompt_tokens"] += pt
+            self.task_usage["completion_tokens"] += ct
+            self.task_usage["cached_tokens"] += cached
+            if is_est:
+                self.task_usage["estimated_tokens"] += (pt + ct)
+
+        if caller == "subagent":
+            self.task_usage["subagent_tokens"] += (pt + ct)
+            self.session_usage["subagent_tokens"] += (pt + ct)
+        elif caller == "coder":
+            self.task_usage["coder_tokens"] += (pt + ct)
+            self.session_usage["coder_tokens"] += (pt + ct)
+        elif caller == "diagnostic":
+            self.task_usage["diagnostic_tokens"] += (pt + ct)
+            self.session_usage["diagnostic_tokens"] += (pt + ct)
+
+        self.session_usage["prompt_tokens"] += pt
+        self.session_usage["completion_tokens"] += ct
+        self.session_usage["cached_tokens"] += cached
+        if is_est:
+            self.session_usage["estimated_tokens"] += (pt + ct)
+
+        prov_stats["in"] += pt
+        prov_stats["out"] += ct
+        prov_stats["cached"] += cached
+        if is_est:
+            prov_stats["est"] += (pt + ct)
+
+        # Legacy USAGE dict sync
+        USAGE["in"] = self.session_usage["prompt_tokens"]
+        USAGE["out"] = self.session_usage["completion_tokens"]
+        USAGE["calls"] = self.session_usage["requests"]
+        USAGE["cin"] = self.session_usage["cached_tokens"]
+        USAGE["cout"] = self.session_usage["completion_tokens"]
+        USAGE["est"] = is_est
+
+    def record_failure(self):
+        self.session_usage["requests_failed"] += 1
+
+    def add_budget(self, additional_tokens: int) -> int:
+        if additional_tokens <= 0:
+            raise ValueError("Additional tokens must be greater than zero.")
+        if self.task_usage.get("budget", 0) <= 0:
+            self.task_usage["paused"] = False
+            TASK_STATE["paused"] = False
+            return 0
+        self.task_usage["budget"] += additional_tokens
+        self.task_usage["paused"] = False
+        TASK_STATE["paused"] = False
+        return self.task_usage["budget"]
+        self.task_usage["paused"] = False
+        return self.task_usage["budget"]
+
+
+BUDGET = BudgetManager()
 
 _ENV_ORIGINAL = {}           # env-provided values never written back to disk
 
@@ -1129,7 +1419,9 @@ def first_run_setup() -> bool:
     print()
 
     if not profile.get("api_key"):
-        if not interactive:
+        if is_local_endpoint(profile.get("base_url", "")):
+            pass  # Local endpoints run on-device and do not require an API key
+        elif not interactive:
             warn(
                 "No API key configured. Set AGENT_API_KEY or edit %s." % CONFIG_FILE
             )
@@ -1174,7 +1466,8 @@ def bootstrap() -> None:
 
     profile = active_profile()
     if profile is not None and not profile.get("api_key"):
-        if sys.stdin.isatty() and "--selftest" not in sys.argv:
+        skip_setup = any(arg in sys.argv for arg in ("--selftest", "--doctor", "--help", "-h", "--version"))
+        if sys.stdin.isatty() and not skip_setup and not is_local_endpoint(profile.get("base_url", "")):
             first_run_setup()
 
     apply_active_profile(CFG)
@@ -1298,11 +1591,13 @@ def list_backups(target_path_str: str = "") -> list:
                 "note": meta.get("note", "snapshot"),
             })
 
+    results.sort(key=lambda x: x.get("stamp", ""), reverse=True)
     return results
 
 
 def restore_backup(target_path_str: str, index: int = 0) -> tuple:
     """Restore a file from its backup snapshot. Takes a snapshot of current state first."""
+    index = _int(index, 0, low=0)
     backups = list_backups(target_path_str)
     if not backups:
         return False, f"No backups found for '{target_path_str}'."
@@ -1323,7 +1618,7 @@ def restore_backup(target_path_str: str, index: int = 0) -> tuple:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(bak_path, dest)
         log_event("undo", f"Restored {chosen['rel']} from {chosen['stamp']}")
-        return True, f"Successfully restored '{chosen['rel']}' to state from {chosen['stamp']}."
+        return True, f"Restored '{chosen['rel']}' to state from {chosen['stamp']}."
     except Exception as exc:
         return False, f"Restore failed: {exc}"
 
@@ -1361,13 +1656,23 @@ def cmd_undo(arg: str = "") -> None:
         err(msg)
 
 
+def tool_undo(path: str = "", index: int = 0) -> str:
+    """Restore a file from automated snapshot backup."""
+    success, msg = restore_backup(path, index)
+    return msg if success else f"Error: {msg}"
+
+
 # ===========================================================================
 # SECTION 8 - Path guard & Safe path resolution
 # ===========================================================================
 
-def safe_path(p) -> Path:
+def safe_path(p, resolve_symlinks: bool = True) -> Path:
     """Return a validated workspace path. Forbids symlink and traversal escapes."""
+    if p is not None and "\0" in str(p):
+        raise PermissionError("Path contains null byte character.")
     raw = str(p if p not in (None, "") else ".").strip()
+    if "\0" in raw:
+        raise PermissionError("Path contains null byte character.")
 
     if raw == "/work":
         raw = "."
@@ -1379,9 +1684,10 @@ def safe_path(p) -> Path:
     # If raw is an absolute path or prefixed path, check if it already targets WORK
     if raw.startswith("/") or raw.startswith("~"):
         try:
-            cand_abs = Path(raw).expanduser().resolve()
-            if cand_abs == work_resolved or is_relative_to(cand_abs, work_resolved):
-                return cand_abs
+            cand_abs = Path(raw).expanduser()
+            cand_resolved = cand_abs.resolve(strict=False)
+            if cand_resolved == work_resolved or is_relative_to(cand_resolved, work_resolved):
+                return cand_resolved if resolve_symlinks else cand_abs
         except Exception:
             pass
 
@@ -1393,29 +1699,37 @@ def safe_path(p) -> Path:
             raw = raw[len(prefix) + 1:]
             break
 
-    candidate = Path(os.path.abspath(WORK / raw))
-
     try:
+        candidate = Path(os.path.abspath(WORK / raw))
         resolved = candidate.resolve(strict=False)
-    except (OSError, RuntimeError) as e:
+    except (OSError, RuntimeError, ValueError) as e:
         raise PermissionError(f"Cannot safely resolve '{raw}': {e}") from e
 
-    is_safe = (
+    cand_safe = (
         candidate == WORK
         or candidate == work_resolved
-        or resolved == WORK
-        or resolved == work_resolved
         or is_relative_to(candidate, WORK)
-        or is_relative_to(resolved, WORK)
-        or is_relative_to(resolved, work_resolved)
+        or is_relative_to(candidate, work_resolved)
     )
-
-    if not is_safe:
+    if not cand_safe:
         raise PermissionError(
             f"'{raw}' resolves outside workspace ({WORK}). Use paths relative to workspace."
         )
 
-    return resolved
+    if resolve_symlinks:
+        is_safe = (
+            resolved == WORK
+            or resolved == work_resolved
+            or is_relative_to(resolved, WORK)
+            or is_relative_to(resolved, work_resolved)
+        )
+        if not is_safe:
+            raise PermissionError(
+                f"'{raw}' resolves outside workspace ({WORK}). Use paths relative to workspace."
+            )
+        return resolved
+
+    return candidate
 
 
 def rel(path) -> str:
@@ -1427,15 +1741,40 @@ def rel(path) -> str:
 
 
 def is_safe_workspace(path: Path) -> bool:
-    """Ensure path is not root or a system-critical directory."""
+    """Ensure path is not root, home, personal shared storage, or system-critical directory."""
     try:
         res = Path(path).resolve()
-        for protected in PROTECTED_WIPE_TARGETS:
+
+        # 1. Direct system directories
+        for p in PROTECTED_WIPE_TARGETS:
             try:
-                if res == protected.resolve():
+                if res == p.resolve():
                     return False
             except Exception:
                 pass
+
+        # 2. Prevent setting workspace directly to Home or parent of Home
+        try:
+            home_res = HOME.resolve()
+            if res == home_res or is_relative_to(home_res, res):
+                return False
+        except Exception:
+            pass
+
+        # 3. Check Android shared storage root (/storage/emulated/0 or /sdcard)
+        for base_sd in ("/storage/emulated/0", "/sdcard"):
+            try:
+                sd = Path(base_sd).resolve()
+                if res == sd or is_relative_to(sd, res):
+                    return False
+                if is_relative_to(res, sd):
+                    rel_parts = res.relative_to(sd).parts
+                    if rel_parts and rel_parts[0].lower() in PROTECTED_ANDROID_NAMES:
+                        if len(rel_parts) == 1:
+                            return False
+            except Exception:
+                pass
+
         return True
     except Exception:
         return False
@@ -1518,6 +1857,25 @@ def tool_read_file(path: str, start_line: int = 1, max_lines: int = 200) -> str:
     return clip(out, MAX_READ_CHARS + 300) or "(empty file)"
 
 
+def atomic_write(target_path: Path, data: str) -> None:
+    """Write data to target_path atomically using temp file and rename."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tag = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    tmp_path = target_path.parent / f".tmp_{target_path.name}_{tag}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
 def tool_write_file(path: str, content: str) -> str:
     try:
         f = safe_path(path)
@@ -1542,8 +1900,7 @@ def tool_write_file(path: str, content: str) -> str:
         create_backup(f, note="write_file")
 
     try:
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(content, encoding="utf-8")
+        atomic_write(f, content)
     except Exception as exc:
         return f"Error writing file: {exc}"
 
@@ -1635,7 +1992,10 @@ def tool_edit_file(path: str, old: str, new: str) -> str:
     # Snapshot before editing
     create_backup(f, note="edit_file")
 
-    f.write_text(result, encoding="utf-8", errors="surrogateescape")
+    try:
+        atomic_write(f, result)
+    except Exception as exc:
+        return f"Error writing edited file: {exc}"
 
     if f.suffix.lower() in (".html", ".htm"):
         LAST_HTML["path"] = rel(f)
@@ -1690,14 +2050,14 @@ def tool_make_dir(path: str) -> str:
 
 def tool_delete_path(path: str) -> str:
     try:
-        p = safe_path(path)
+        p = safe_path(path, resolve_symlinks=False)
     except PermissionError as e:
         return f"Error: {e}"
 
     if p == WORK:
         return "Error: cannot delete workspace root."
 
-    if not p.exists():
+    if not p.exists() and not p.is_symlink():
         return f"'{path}' does not exist."
 
     # Backup files prior to deletion
@@ -1717,19 +2077,20 @@ def tool_delete_path(path: str) -> str:
 
 def tool_move_path(src: str, dst: str) -> str:
     try:
-        s = safe_path(src)
-        d = safe_path(dst)
+        s = safe_path(src, resolve_symlinks=False)
+        d = safe_path(dst, resolve_symlinks=False)
     except PermissionError as e:
         return f"Error: {e}"
 
-    if not s.exists():
+    if not s.exists() and not s.is_symlink():
         return f"Error: '{src}' does not exist."
 
     if s == WORK:
         return "Error: cannot move workspace root."
 
-    if d.is_file():
-        create_backup(d, note="move-overwrite")
+    target_dest = d / s.name if d.is_dir() else d
+    if target_dest.is_file():
+        create_backup(target_dest, note="move-overwrite")
 
     try:
         d.parent.mkdir(parents=True, exist_ok=True)
@@ -2039,7 +2400,11 @@ def proot_selftest() -> tuple:
 def setup_sandbox() -> None:
     want = CFG.get("sandbox", "auto")
     if want == "off":
-        SANDBOX.update(mode="off", note="commands disabled")
+        SANDBOX.update(mode="off", note="command execution disabled")
+        return
+
+    if want == "local":
+        SANDBOX.update(mode="local", note="restricted local execution (no OS isolation; guarded regex & path boundaries)")
         return
 
     if want in ("auto", "proot"):
@@ -2050,14 +2415,21 @@ def setup_sandbox() -> None:
         if want == "proot":
             SANDBOX.update(mode="off", note="proot requested but unusable: " + msg)
             return
+        # Fail-safe sandbox behavior (FlowCo v5.0):
+        # Do not silently fall back to local execution. Disable commands until user explicitly chooses.
+        SANDBOX.update(
+            mode="off",
+            note="PRoot isolation unavailable (" + msg + "). Commands disabled for safety. Run '/sandbox local' to explicitly enable restricted local execution."
+        )
+        return
 
-    SANDBOX.update(mode="local", note="guarded local mode")
+    SANDBOX.update(mode="local", note="restricted local execution (no OS isolation)")
 
 
 _ALLOWED_DEV = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/zero"}
 _PATHLIKE = re.compile(r"""(?:^|[\s'"=(<>;|&`])((?:/|~)[^\s'"();|<>&`]*)""")
-_DOTDOT = re.compile(r"""(?:^|[\s/'"])(?:\.\.)(?:$|[\s/'"])""")
-_BANNED = re.compile(r"""(?:^|[\s;|&(`])(sudo|su|tsu|chroot|termux-[\w-]+|busybox|magisk)(?:$|[\s;|&)])""", re.I)
+_DOTDOT = re.compile(r"""(?:^|[\s/'";|&()`<>])\.\.(?:$|[\s/'";|&()`<>])""")
+_BANNED = re.compile(r"""(?:^|[\s;|&(`"'><])(sudo|su|tsu|chroot|termux-[\w-]+|busybox|magisk)(?:$|[\s;|&)`"'\n])""", re.I)
 
 
 def local_guard(command: str):
@@ -2072,10 +2444,15 @@ def local_guard(command: str):
     work_res = WORK.resolve()
     for m in _PATHLIKE.finditer(command):
         tok = m.group(1)
-        if tok in _ALLOWED_DEV or tok == "~" or tok.startswith("~/"):
+        if tok in _ALLOWED_DEV:
             continue
         try:
-            p = Path(tok).expanduser().resolve()
+            if tok == "~":
+                p = work_res
+            elif tok.startswith("~/"):
+                p = (WORK / tok[2:]).resolve()
+            else:
+                p = Path(tok).expanduser().resolve()
         except Exception:
             return f"Blocked: cannot verify path '{tok}'."
         if p == WORK or p == work_res or is_relative_to(p, WORK) or is_relative_to(p, work_res):
@@ -2086,6 +2463,11 @@ def local_guard(command: str):
 
 def local_env() -> dict:
     tmp = WORK / ".tmp"
+    if tmp.is_file():
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
     tmp.mkdir(exist_ok=True)
     env = {k: v for k, v in os.environ.items() if k in (
         "PATH", "LANG", "LC_ALL", "TERM", "LD_LIBRARY_PATH", "LD_PRELOAD"
@@ -2104,7 +2486,7 @@ def exec_command(command: str, timeout: int = None) -> str:
         return "Error: sandbox is disabled."
 
     if mode == "proot":
-        argv, cwd, env = proot_argv(command), None, None
+        argv, cwd, env = proot_argv(command), None, local_env()
     else:
         blocked = local_guard(command)
         if blocked:
@@ -2155,18 +2537,34 @@ def exec_command(command: str, timeout: int = None) -> str:
         set_tmux_title("Idle", "FlowCo:Idle")
 
 
+def check_command_confirmation(command: str) -> tuple:
+    """Validate user approval when confirm_commands is active. Returns (allowed: bool, msg: str)."""
+    if not (CFG or {}).get("confirm_commands"):
+        return True, "OK"
+    if os.environ.get("FLOWCO_YES") == "1" or (CFG or {}).get("auto_confirm"):
+        return True, "Approved (auto_confirm)"
+    if not sys.stdin.isatty():
+        return False, "Error: Command requires user confirmation, but session is running non-interactively without approval policy."
+    print()
+    print(paint("  ⚠️  Approve Execution of Command?", "yellow", "bold"))
+    print("  " + command)
+    try:
+        ans = input("  Execute? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False, "Command rejected (interrupted input)."
+    if ans in ("y", "yes"):
+        return True, "Approved"
+    return False, "Command rejected by user."
+
+
 def tool_run_command(command: str) -> str:
     command = str(command or "").strip()
     if not command:
         return "Error: command is empty."
 
-    if CFG.get("confirm_commands") and sys.stdin.isatty():
-        print()
-        print(paint("  Execute Command?", "yellow", "bold"))
-        print("  " + command)
-        ans = input("  [y/N]: ").strip().lower()
-        if ans != "y":
-            return "Command rejected by user."
+    allowed, msg = check_command_confirmation(command)
+    if not allowed:
+        return msg
 
     return exec_command(command)
 
@@ -2367,11 +2765,25 @@ def _read_coder(r, prompt_chars: int):
 
 
 def coder_complete(system: str, user: str):
-    base = clean_base_url(CFG.get("coder_base_url") or CFG["base_url"])
-    key = CFG.get("coder_api_key") or CFG["api_key"]
+    if os.environ.get("FLOWCO_TEST_MODE") == "1":
+        BUDGET.record_request_start(caller="coder")
+        pt = max(1, (len(system) + len(user)) // 4)
+        ct = 50
+        BUDGET.record_success(caller="coder", prompt_tokens=pt, completion_tokens=ct, is_est=True)
+        return "mock coder response", "stop"
+
+    prompt_chars = len(system) + len(user)
+    est = prompt_chars // 4 + 1000
+    allowed, reason = BUDGET.check_pre_request(est, caller="coder")
+    if not allowed:
+        raise RuntimeError(reason)
+    BUDGET.record_request_start(caller="coder")
+
+    base = clean_base_url(CFG.get("coder_base_url") or CFG.get("base_url", ""))
+    key = CFG.get("coder_api_key") or CFG.get("api_key", "")
 
     body = {
-        "model": CFG["coder_model"],
+        "model": CFG.get("coder_model", ""),
         "temperature": 0.2,
         "stream": True,
         "max_tokens": int(CFG.get("coder_max_tokens", 12000)),
@@ -2394,19 +2806,24 @@ def coder_complete(system: str, user: str):
         )
         try:
             with urllib.request.urlopen(req, timeout=180) as r:
-                return _read_coder(r, len(system) + len(user))
+                text, finish = _read_coder(r, prompt_chars)
+                BUDGET.record_success(in_chars=prompt_chars, out_chars=len(text), caller="coder")
+                return text, finish
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:400]
             last_err = f"HTTP {e.code}: {detail}"
+            BUDGET.record_retry()
             if e.code in (429, 500, 502, 503, 504):
                 time.sleep(2 * (attempt + 1))
                 continue
             break
         except Exception as e:
             last_err = str(e)
+            BUDGET.record_retry()
             time.sleep(2 * (attempt + 1))
 
-    raise RuntimeError(last_err)
+    BUDGET.record_failure()
+    raise RuntimeError(f"Coder model error: {last_err}")
 
 
 def syntax_check(f: Path) -> str:
@@ -2673,6 +3090,12 @@ def tool_git(args: str) -> str:
     for a in parts:
         if a == "-c" or a.startswith(GIT_BAD_OPTS):
             return f"Error: option '{a}' not permitted."
+
+    destructive = parts[0] in ("reset", "clean", "restore") or any(o in parts for o in ("--hard", "-f", "--force"))
+    if destructive or ((CFG or {}).get("confirm_commands") and parts[0] in ("commit", "rm")):
+        allowed, msg = check_command_confirmation("git " + " ".join(parts))
+        if not allowed:
+            return msg
 
     prefix = [
         "git", "--no-pager",
@@ -3037,8 +3460,17 @@ def tool_run_background(command: str, description: str = "") -> str:
     if mode == "off":
         return "Error: sandbox is disabled."
 
+    allowed, msg = check_command_confirmation(command)
+    if not allowed:
+        return msg
+
+    # Limit concurrent active background tasks
+    active_bgs = [tid for tid, t in BACKGROUND_TASKS.items() if t.get("proc") and t["proc"].poll() is None]
+    if len(active_bgs) >= 5:
+        return "Error: Maximum concurrent background jobs (5) reached. Terminate an existing job with /bg kill or wait for completion."
+
     if mode == "proot":
-        argv, cwd, env = proot_argv(command), None, None
+        argv, cwd, env = proot_argv(command), None, local_env()
     else:
         blocked = local_guard(command)
         if blocked:
@@ -3129,22 +3561,112 @@ def tool_kill_task(task_id: str) -> str:
     if not t:
         return f"Error: no background task found with ID '{tid}'."
 
-    proc = t["proc"]
-    if proc.poll() is not None:
-        return f"Task '{tid}' has already exited (code {proc.returncode})."
+    proc = t.get("proc")
+    if not proc or proc.poll() is not None:
+        ret = proc.returncode if proc else "unknown"
+        if t.get("handle"):
+            try:
+                t["handle"].close()
+            except Exception:
+                pass
+        return f"Task '{tid}' has already exited (code {ret})."
 
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        time.sleep(0.5)
-        if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=1.0)
+        except (subprocess.TimeoutExpired, Exception):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        if t.get("handle"):
+            try:
+                t["handle"].close()
+            except Exception:
+                pass
         return f"Successfully terminated background task '{tid}'."
     except Exception as e:
         return f"Error terminating task '{tid}': {e}"
 
 
+def stop_background_tasks() -> None:
+    """Terminate all background tasks on application shutdown."""
+    for tid, t in list(BACKGROUND_TASKS.items()):
+        proc = t.get("proc")
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=0.5)
+            except Exception:
+                pass
+        if t.get("handle"):
+            try:
+                t["handle"].close()
+            except Exception:
+                pass
+
+
+atexit.register(stop_background_tasks)
+
+
+def detect_task_cycles(tasks: dict) -> bool:
+    """Detect circular dependencies in task DAG using depth-first search."""
+    visited = {tid: 0 for tid in tasks}  # 0: unvisited, 1: visiting, 2: visited
+
+    def dfs(node):
+        visited[node] = 1
+        for dep in tasks[node].get("depends_on") or []:
+            if dep in tasks:
+                if visited.get(dep) == 1:
+                    return True
+                if visited.get(dep) == 0:
+                    if dfs(dep):
+                        return True
+        visited[node] = 2
+        return False
+
+    for tid in tasks:
+        if visited.get(tid) == 0:
+            if dfs(tid):
+                return True
+    return False
+
+
+def refresh_task_states() -> None:
+    """Compute and refresh task execution states based on dependencies."""
+    tasks = TASK_GRAPH["tasks"]
+    for tid in TASK_GRAPH["order"]:
+        t = tasks.get(tid)
+        if not t:
+            continue
+        cur = t.get("status", "PENDING")
+        if cur in ("DONE", "FAILED", "CANCELLED", "IN_PROGRESS"):
+            continue
+
+        deps = t.get("depends_on") or []
+        if not deps:
+            if cur in ("PENDING", "BLOCKED"):
+                t["status"] = "READY"
+            continue
+
+        dep_statuses = [tasks[d]["status"] for d in deps if d in tasks]
+        if len(dep_statuses) < len(deps):
+            t["status"] = "BLOCKED"
+        elif any(st in ("FAILED", "CANCELLED") for st in dep_statuses):
+            t["status"] = "BLOCKED"
+        elif all(st == "DONE" for st in dep_statuses):
+            t["status"] = "READY"
+        else:
+            t["status"] = "PENDING"
+
+
 def tool_task_graph(action: str, task_id: str = "", title: str = "", status: str = "", depends_on: str = "") -> str:
-    """Manage structured task DAG: track subtasks, dependencies, and execution state."""
+    """Manage structured task DAG: track subtasks, dependencies, cycle detection, and ready states."""
     act = (action or "").strip().lower()
     if act == "init":
         TASK_GRAPH["tasks"].clear()
@@ -3152,86 +3674,166 @@ def tool_task_graph(action: str, task_id: str = "", title: str = "", status: str
         return "Task execution graph initialized."
 
     if act == "add":
-        tid = task_id or f"task_{len(TASK_GRAPH['order']) + 1}"
+        tid = (task_id or f"task_{len(TASK_GRAPH['order']) + 1}").strip()
+        if tid in TASK_GRAPH["tasks"]:
+            return f"Error: task '{tid}' already exists in graph. Use action='update' to modify."
+
+        deps = []
+        if depends_on:
+            if isinstance(depends_on, list):
+                deps = [str(d).strip() for d in depends_on if str(d).strip()]
+            else:
+                deps = [d.strip() for d in str(depends_on).split(",") if d.strip()]
+
         TASK_GRAPH["tasks"][tid] = {
             "id": tid,
             "title": title or tid,
             "status": (status or "PENDING").upper(),
-            "depends_on": depends_on or None,
+            "depends_on": deps,
         }
         if tid not in TASK_GRAPH["order"]:
             TASK_GRAPH["order"].append(tid)
+
+        if detect_task_cycles(TASK_GRAPH["tasks"]):
+            del TASK_GRAPH["tasks"][tid]
+            TASK_GRAPH["order"].remove(tid)
+            return f"Error: Circular dependency detected when adding '{tid}'."
+
+        refresh_task_states()
         return f"Added task '{tid}': {title or tid}"
 
     if act == "update":
-        if not task_id or task_id not in TASK_GRAPH["tasks"]:
+        tid = str(task_id or "").strip()
+        if not tid or tid not in TASK_GRAPH["tasks"]:
             return f"Error: task '{task_id}' not found in graph."
-        t = TASK_GRAPH["tasks"][task_id]
+        t = TASK_GRAPH["tasks"][tid]
+
+        if depends_on is not None and str(depends_on).strip().lower() in ("", "none", "clear", "[]"):
+            t["depends_on"] = []
+        elif depends_on:
+            old_deps = list(t.get("depends_on") or [])
+            if isinstance(depends_on, list):
+                new_deps = [str(d).strip() for d in depends_on if str(d).strip()]
+            else:
+                new_deps = [d.strip() for d in str(depends_on).split(",") if d.strip()]
+            t["depends_on"] = new_deps
+            if detect_task_cycles(TASK_GRAPH["tasks"]):
+                t["depends_on"] = old_deps
+                return f"Error: Circular dependency detected updating '{tid}'."
+
         if status:
             t["status"] = status.upper()
         if title:
             t["title"] = title
-        return f"Updated task '{task_id}' status to {t['status']}."
+
+        refresh_task_states()
+        return f"Updated task '{tid}' status to {t['status']}."
+
+    if act in ("delete", "remove"):
+        tid = str(task_id or "").strip()
+        if not tid or tid not in TASK_GRAPH["tasks"]:
+            return f"Error: task '{task_id}' not found in graph."
+        del TASK_GRAPH["tasks"][tid]
+        if tid in TASK_GRAPH["order"]:
+            TASK_GRAPH["order"].remove(tid)
+        for other_t in TASK_GRAPH["tasks"].values():
+            if tid in (other_t.get("depends_on") or []):
+                other_t["depends_on"].remove(tid)
+        refresh_task_states()
+        return f"Deleted task '{tid}' from execution graph."
 
     if act == "show":
+        refresh_task_states()
         if not TASK_GRAPH["order"]:
             return "Task graph is empty. Use task_graph(action='add', title=...) to add tasks."
-        lines = ["=== Execution Task Graph ==="]
+        lines = ["=== Execution Task Graph (DAG) ==="]
         done_count = 0
         for tid in TASK_GRAPH["order"]:
             t = TASK_GRAPH["tasks"][tid]
             st = t["status"]
             if st == "DONE":
                 done_count += 1
-            dep = f" [needs: {t['depends_on']}]" if t.get("depends_on") else ""
+            dep_list = t.get("depends_on") or []
+            dep = f" [needs: {', '.join(dep_list)}]" if dep_list else ""
             lines.append(f"  [{st}] {tid}: {t['title']}{dep}")
         pct = (done_count / len(TASK_GRAPH["order"])) * 100 if TASK_GRAPH["order"] else 0
         lines.append(f"Progress: {done_count}/{len(TASK_GRAPH['order'])} tasks completed ({pct:.0f}%)")
         return "\n".join(lines)
 
-    return "Error: action must be 'init', 'add', 'update', or 'show'."
+    return "Error: action must be 'init', 'add', 'update', 'delete', or 'show'."
 
 
-def tool_verify(command: str, check_file: str = "") -> str:
-    """Autonomous verification gate: executes test command and checks file invariants."""
-    cmd = str(command or "").strip()
-    if not cmd:
-        return "Error: verify command cannot be empty."
+def tool_verify(command: str = "", check_file: str = "", syntax_check: str = "") -> str:
+    """Autonomous verification gate: executes test command, validates exit codes, syntax, and file existence."""
+    issues = []
 
-    res = exec_command(cmd)
-    fail = is_error(res)
+    # 1. Syntax check
+    if syntax_check:
+        try:
+            p = safe_path(syntax_check)
+            if not p.is_file():
+                issues.append(f"Target file for syntax check '{syntax_check}' not found.")
+            else:
+                ext = p.suffix.lower()
+                content = p.read_text(encoding="utf-8", errors="replace")
+                if ext == ".py":
+                    try:
+                        ast.parse(content, filename=str(p))
+                    except SyntaxError as syn_err:
+                        issues.append(f"Python syntax error in '{syntax_check}': {syn_err}")
+                elif ext == ".json":
+                    try:
+                        json.loads(content)
+                    except Exception as j_err:
+                        issues.append(f"JSON syntax error in '{syntax_check}': {j_err}")
+        except Exception as e:
+            issues.append(f"Syntax validation failed for '{syntax_check}': {e}")
 
-    file_ok = True
-    file_msg = ""
+    # 2. Command check with real process exit code
+    if command:
+        cmd_str = command.strip()
+        try:
+            if SANDBOX.get("mode") == "proot":
+                argv = proot_argv(cmd_str)
+                cwd = None
+            else:
+                argv = ["bash", "-c", cmd_str]
+                cwd = str(WORK)
+
+            proc = subprocess.run(
+                argv,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=int(CFG.get("cmd_timeout", 120)) if CFG else 120,
+                errors="replace",
+            )
+            if proc.returncode != 0:
+                issues.append(
+                    f"Command '{cmd_str}' failed with exit code {proc.returncode}.\n"
+                    f"Stderr: {clip(proc.stderr or '', 500)}\n"
+                    f"Stdout: {clip(proc.stdout or '', 300)}"
+                )
+        except subprocess.TimeoutExpired:
+            issues.append(f"Command '{cmd_str}' timed out.")
+        except Exception as ex:
+            issues.append(f"Command execution error: {ex}")
+
+    # 3. File existence and size check
     if check_file:
         try:
             p = safe_path(check_file)
             if not p.exists() or p.stat().st_size == 0:
-                file_ok = False
-                file_msg = f"Check file '{check_file}' does not exist or is empty."
-            else:
-                file_msg = f"Check file '{check_file}' verified ({format_bytes(p.stat().st_size)})."
+                issues.append(f"Check file '{check_file}' does not exist or is empty.")
         except Exception as e:
-            file_ok = False
-            file_msg = f"Check file verification error: {e}"
+            issues.append(f"Check file error for '{check_file}': {e}")
 
-    if not fail and file_ok:
-        return (
-            "[VERIFICATION PASSED]\n"
-            f"Command Output:\n{res}\n"
-            f"{file_msg}"
-        )
-    else:
-        reasons = []
-        if fail:
-            reasons.append("Command execution failed or returned error.")
-        if not file_ok:
-            reasons.append(file_msg)
-        return (
-            "[VERIFICATION FAILED]\n"
-            f"Reasons: {'; '.join(reasons)}\n"
-            f"Command Output:\n{res}"
-        )
+    if not command and not check_file and not syntax_check:
+        return "Error: verify requires 'command', 'check_file', or 'syntax_check'."
+
+    if issues:
+        return "[VERIFICATION FAILED]\n" + "\n".join(issues)
+    return "[VERIFICATION PASSED]\nAll verification checks succeeded."
 
 
 def tool_learn_skill(name: str, trigger: str, solution: str) -> str:
@@ -3286,14 +3888,29 @@ def tool_spawn_subagent(role: str, task: str, max_steps: int = 8) -> str:
         return "Error: subagent task cannot be empty."
 
     steps_limit = _int(max_steps, 8, low=1, high=20)
-    sub_prompt = f"""You are a specialized subagent for FlowCo v4.5.
+    role_lower = role_str.lower()
+
+    # FlowCo v5.0: Role-based capability permissions
+    readonly_tools = {"list_files", "read_file", "search_files", "file_info", "web_search", "web_fetch", "task_graph", "verify"}
+    debug_tools = readonly_tools | {"run_command", "write_file", "edit_file"}
+    coder_tools = set(TOOL_FUNCS.keys()) - {"wipe", "spawn_subagent", "shutdown", "reset"}
+
+    if "research" in role_lower or "reviewer" in role_lower or "auditor" in role_lower:
+        allowed_tools = readonly_tools
+    elif "debug" in role_lower or "test" in role_lower:
+        allowed_tools = debug_tools
+    else:
+        allowed_tools = coder_tools
+
+    sub_prompt = f"""You are a specialized subagent for FlowCo v5.0.
 Role: {role_str}
 Workspace: {WORK}
 Your mission: {task_str}
+Permitted capabilities: {', '.join(sorted(allowed_tools))}
 
 Follow these instructions:
 1. Focus exclusively on your assigned mission.
-2. Use tools to inspect, research, verify, or download as needed.
+2. Use permitted tools only. Dangerous tools (wipe, shutdown, recursive spawning) are strictly prohibited.
 3. Once your mission is achieved, provide a comprehensive, clear synthesis report.
 4. Keep the final report self-contained and concise so the parent agent can utilize it immediately."""
 
@@ -3302,44 +3919,48 @@ Follow these instructions:
         {"role": "user", "content": task_str},
     ]
 
+    sub_tools = [t for t in (TOOLS or []) if t.get("function", {}).get("name") in allowed_tools]
+
     set_tmux_title(f"Subagent: {role_str}", "FlowCo:Sub")
     step = 0
     final_report = ""
 
-    while step < steps_limit:
-        step += 1
-        try:
-            resp = chat(sub_messages)
-            msg = resp["choices"][0]["message"]
-        except Exception as e:
-            return f"Subagent error during communication: {e}"
+    try:
+        while step < steps_limit:
+            step += 1
+            try:
+                resp = chat_plain(sub_messages, caller="subagent", tools=sub_tools)
+                msg = resp["choices"][0]["message"]
+            except Exception as e:
+                return f"Subagent error during communication: {e}"
 
-        sub_messages.append(msg)
-        tcs = msg.get("tool_calls") or []
-        if not tcs:
-            final_report = msg.get("content", "").strip()
-            break
+            sub_messages.append(msg)
+            tcs = msg.get("tool_calls") or []
+            if not tcs:
+                final_report = msg.get("content", "").strip()
+                break
 
-        for tc in tcs:
-            fn_info = tc.get("function") or {}
-            fname = fn_info.get("name", "")
-            raw_a = fn_info.get("arguments", "{}")
-            args = clean_args(fname, parse_args(raw_a))
-            if fname in TOOL_FUNCS and fname != "spawn_subagent":
-                try:
-                    out = TOOL_FUNCS[fname](**args)
-                except Exception as ex:
-                    out = f"Error: {ex}"
-            else:
-                out = f"Error: tool '{fname}' not available in subagent."
-            sub_messages.append({
-                "role": "tool",
-                "tool_call_id": tc.get("id") or new_call_id(),
-                "name": fname,
-                "content": clip(str(out), 2000),
-            })
+            for tc in tcs:
+                fn_info = tc.get("function") or {}
+                fname = fn_info.get("name", "")
+                raw_a = fn_info.get("arguments", "{}")
+                args = clean_args(fname, parse_args(raw_a))
+                if fname in allowed_tools and fname in TOOL_FUNCS and fname not in ("spawn_subagent", "wipe", "shutdown", "reset"):
+                    try:
+                        out = TOOL_FUNCS[fname](**args)
+                    except Exception as ex:
+                        out = f"Error: {ex}"
+                else:
+                    out = f"Error: tool '{fname}' not permitted for subagent role '{role_str}'."
+                sub_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or new_call_id(),
+                    "name": fname,
+                    "content": clip(str(out), 2000),
+                })
+    finally:
+        set_tmux_title("Idle", "FlowCo:Idle")
 
-    set_tmux_title("Idle", "FlowCo:Idle")
     if not final_report:
         final_report = "Subagent reached step limit without final output."
 
@@ -3498,6 +4119,8 @@ def build_tools():
 
 def apply_quirks(body: dict) -> dict:
     b = dict(body)
+    if not STREAM_STATE.get("usage", True):
+        b.pop("stream_options", None)
     if API_QUIRKS.get("max_key") == "max_completion_tokens":
         if "max_tokens" in b:
             b["max_completion_tokens"] = b.pop("max_tokens")
@@ -3506,6 +4129,12 @@ def apply_quirks(body: dict) -> dict:
     if API_QUIRKS.get("no_reasoning_effort"):
         b.pop("reasoning_effort", None)
     return b
+
+
+def _msg_size(m) -> int:
+    return len(str(m.get("content") or "")) + sum(
+        len(t.get("function", {}).get("arguments", "")) for t in m.get("tool_calls") or []
+    )
 
 
 def learn_quirk(detail: str) -> bool:
@@ -3555,14 +4184,17 @@ def record_usage(usage, in_chars: int, out_chars: int) -> None:
 
 
 def _request(body: dict):
-    base = clean_base_url(CFG["base_url"])
+    base = clean_base_url(CFG.get("base_url", DEFAULT_BASE_URL))
     url = base + "/chat/completions"
     data = json.dumps(apply_quirks(body)).encode("utf-8")
+    api_key = CFG.get("api_key", "")
+    if not api_key and is_local_endpoint(base):
+        api_key = "local-no-key"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer " + CFG.get("api_key", ""),
+        "Authorization": "Bearer " + api_key,
         "Accept": "text/event-stream" if body.get("stream") else "application/json",
-        "User-Agent": "FlowCo/4.0 (Termux; Android)",
+        "User-Agent": "FlowCo/5.0 (Termux; Android)",
     }
     return urllib.request.Request(url, data=data, headers=headers)
 
@@ -3577,19 +4209,42 @@ def extract_reasoning(obj) -> str:
     return ""
 
 
-def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
+def chat_stream(messages, tool_choice="auto", usage_opt: bool = True, caller: str = "main", tools: list = None):
     """Streaming chat completion with SSE parser, retry logic, and tool extraction."""
+    if os.environ.get("FLOWCO_TEST_MODE") == "1":
+        is_sub = (caller == "subagent")
+        allowed, reason = BUDGET.check_pre_request(estimated_tokens=150, is_subagent=is_sub, caller=caller)
+        if not allowed:
+            raise RuntimeError(reason)
+        BUDGET.record_request_start(caller=caller)
+        pt, ct = 100, 50
+        BUDGET.record_success(caller=caller, provider="mock", prompt_tokens=pt, completion_tokens=ct, cached_tokens=0, is_est=False)
+        msg = {"role": "assistant", "content": "FlowCo mock streaming response (FLOWCO_TEST_MODE=1)."}
+        return {
+            "choices": [{"message": msg, "finish_reason": "stop"}],
+            "streamed_live": True,
+        }
+
+    in_chars = sum(len(str(m.get("content") or "")) for m in messages)
+    est_tokens = max(100, in_chars // 4 + int((CFG or {}).get("max_tokens", 8192) or 8192) // 4)
+    is_sub = (caller == "subagent")
+    allowed, reason = BUDGET.check_pre_request(estimated_tokens=est_tokens, is_subagent=is_sub, caller=caller)
+    if not allowed:
+        raise RuntimeError(reason)
+    BUDGET.record_request_start(caller=caller)
+
     body = {
-        "model": CFG["model"],
+        "model": (CFG or {}).get("model", DEFAULT_MODEL),
         "messages": messages,
-        "temperature": float(CFG.get("temperature", 0.2)),
-        "max_tokens": int(CFG.get("max_tokens", 8192)),
+        "temperature": float((CFG or {}).get("temperature", 0.2)),
+        "max_tokens": int((CFG or {}).get("max_tokens", 8192)),
         "stream": True,
     }
     if usage_opt:
         body["stream_options"] = {"include_usage": True}
-    if TOOLS:
-        body["tools"] = TOOLS
+    active_tools = tools if tools is not None else TOOLS
+    if active_tools:
+        body["tools"] = active_tools
         body["tool_choice"] = tool_choice
 
     reason_info = CURRENT.get("reasoning") or {}
@@ -3617,6 +4272,11 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
                         chunk = json.loads(payload)
                     except Exception:
                         continue
+
+                    if chunk.get("error"):
+                        err_obj = chunk["error"]
+                        err_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+                        raise RuntimeError(f"Stream error: {err_msg}")
 
                     if chunk.get("usage"):
                         usage = chunk["usage"]
@@ -3648,13 +4308,19 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
                             sys.stdout.flush()
 
                         for tc in delta.get("tool_calls") or []:
-                            idx = tc.get("index", 0)
+                            idx = int(tc.get("index") or 0)
                             slot = calls.setdefault(idx, {"id": "", "name": "", "args": []})
                             if tc.get("id"):
                                 slot["id"] = tc["id"]
                             fn = tc.get("function") or {}
                             if fn.get("name"):
-                                slot["name"] += fn["name"]
+                                fn_name_chunk = fn["name"]
+                                if not slot["name"]:
+                                    slot["name"] = fn_name_chunk
+                                elif slot["name"] == fn_name_chunk:
+                                    pass
+                                else:
+                                    slot["name"] += fn_name_chunk
                             if fn.get("arguments"):
                                 slot["args"].append(fn["arguments"])
 
@@ -3667,7 +4333,7 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
 
                 full_text = "".join(text_parts)
                 tcs = []
-                for idx, slot in sorted(calls.items()):
+                for idx, slot in sorted(calls.items(), key=lambda x: int(x[0])):
                     if slot["name"]:
                         tcs.append({
                             "id": slot["id"] or new_call_id(),
@@ -3690,7 +4356,7 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
                     msg["tool_calls"] = tcs
 
                 out_chars = len(full_text) + sum(len(t["function"]["arguments"]) for t in tcs)
-                record_usage(usage, in_chars, out_chars)
+                BUDGET.record_success(usage, in_chars, out_chars, caller=caller)
                 return {
                     "choices": [{"message": msg, "finish_reason": finish}],
                     "streamed_live": bool(text_parts),
@@ -3699,6 +4365,7 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
             last_err = f"HTTP {e.code}: {detail}"
+            BUDGET.record_retry()
             if "stream_options" in detail.lower() and "stream_options" in body:
                 del body["stream_options"]
                 STREAM_STATE["usage"] = False
@@ -3712,40 +4379,80 @@ def chat_stream(messages, tool_choice="auto", usage_opt: bool = True):
             break
         except Exception as e:
             last_err = str(e)
+            BUDGET.record_retry()
             time.sleep(2 * (attempt + 1))
 
+    BUDGET.record_failure()
     raise RuntimeError(last_err or "API request failed.")
 
 
-def chat(messages, tool_choice="auto"):
-    if CFG.get("stream", True):
+def chat(messages, tool_choice="auto", caller: str = "main", tools: list = None):
+    if (CFG or {}).get("stream", True):
         try:
-            return chat_stream(messages, tool_choice, usage_opt=STREAM_STATE["usage"])
+            return chat_stream(messages, tool_choice, usage_opt=STREAM_STATE["usage"], caller=caller, tools=tools)
         except Exception as e:
             if "stream" in str(e).lower():
                 pass
             else:
                 raise
-    return chat_plain(messages, tool_choice)
+    return chat_plain(messages, tool_choice, caller=caller, tools=tools)
 
 
-def chat_plain(messages, tool_choice="auto"):
+def chat_plain(messages, tool_choice="auto", caller: str = "main", tools: list = None):
+    if os.environ.get("FLOWCO_TEST_MODE") == "1":
+        is_sub = (caller == "subagent")
+        allowed, reason = BUDGET.check_pre_request(estimated_tokens=150, is_subagent=is_sub, caller=caller)
+        if not allowed:
+            raise RuntimeError(reason)
+        BUDGET.record_request_start(caller=caller)
+        pt, ct = 100, 50
+        BUDGET.record_success(caller=caller, provider="mock", prompt_tokens=pt, completion_tokens=ct, cached_tokens=0, is_est=False)
+        model = (CFG or {}).get("model") or "mock-model"
+        return {
+            "id": "mock-test-id",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "FlowCo mock response (FLOWCO_TEST_MODE=1).",
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": pt + ct,
+            },
+            "streamed_live": False,
+        }
+
+    in_chars = sum(len(str(m.get("content") or "")) for m in messages)
+    est_tokens = max(100, in_chars // 4 + int((CFG or {}).get("max_tokens", 8192) or 8192) // 4)
+    is_sub = (caller == "subagent")
+    allowed, reason = BUDGET.check_pre_request(estimated_tokens=est_tokens, is_subagent=is_sub, caller=caller)
+    if not allowed:
+        raise RuntimeError(reason)
+    BUDGET.record_request_start(caller=caller)
+
     body = {
-        "model": CFG["model"],
+        "model": (CFG or {}).get("model", DEFAULT_MODEL),
         "messages": messages,
-        "temperature": float(CFG.get("temperature", 0.2)),
-        "max_tokens": int(CFG.get("max_tokens", 8192)),
+        "temperature": float((CFG or {}).get("temperature", 0.2)),
+        "max_tokens": int((CFG or {}).get("max_tokens", 8192)),
         "stream": False,
     }
-    if TOOLS:
-        body["tools"] = TOOLS
+    active_tools = tools if tools is not None else TOOLS
+    if active_tools:
+        body["tools"] = active_tools
         body["tool_choice"] = tool_choice
 
     reason_info = CURRENT.get("reasoning") or {}
     if reason_info.get("param"):
         body["reasoning_effort"] = reason_info["param"]
 
-    in_chars = sum(len(str(m.get("content") or "")) for m in messages)
     last_err = None
 
     for attempt in range(4):
@@ -3753,9 +4460,9 @@ def chat_plain(messages, tool_choice="auto"):
             req = _request(body)
             with urllib.request.urlopen(req, timeout=120) as resp:
                 res = json.load(resp)
-                record_usage(res.get("usage"), in_chars, len(str(res)))
-
                 choices = res.get("choices") or []
+                tcs = []
+                content = ""
                 if choices:
                     msg = choices[0].get("message") or {}
                     tcs = msg.get("tool_calls") or []
@@ -3765,11 +4472,16 @@ def chat_plain(messages, tool_choice="auto"):
                         if extracted:
                             msg["tool_calls"] = extracted
                             msg["content"] = remaining
+                            tcs = extracted
+                            content = remaining
+                out_chars = len(content) + sum(len(t.get("function", {}).get("arguments", "")) for t in tcs)
+                BUDGET.record_success(res.get("usage"), in_chars, out_chars, caller=caller)
                 res["streamed_live"] = False
                 return res
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:500]
             last_err = f"HTTP {e.code}: {detail}"
+            BUDGET.record_retry()
             if learn_quirk(detail):
                 continue
             if e.code in (429, 500, 502, 503, 504):
@@ -3778,8 +4490,10 @@ def chat_plain(messages, tool_choice="auto"):
             break
         except Exception as e:
             last_err = str(e)
+            BUDGET.record_retry()
             time.sleep(2 * (attempt + 1))
 
+    BUDGET.record_failure()
     raise RuntimeError(last_err or "API request failed.")
 
 
@@ -4029,109 +4743,135 @@ def is_error(result: str) -> bool:
 
 def run_turn(messages, task: str = None) -> None:
     """Autonomous agent turn execution loop."""
+    budget = int(CFG.get("task_token_budget", 250000)) if CFG else 250000
+    is_continuation = False
     if task:
+        task_clean = task.strip().lower()
+        if task_clean in ("continue", "c", "resume", "go on", "proceed", "next") and BUDGET.task_usage.get("task_id"):
+            is_continuation = True
+
+    if task and not is_continuation:
         CURRENT["request"] = task
         CURRENT["task_id"] = short_stamp()
         CURRENT["warned_budget"] = False
+        BUDGET.start_task(CURRENT["task_id"], budget=budget)
+    elif not BUDGET.task_usage.get("task_id"):
+        BUDGET.start_task(CURRENT.get("task_id") or short_stamp(), budget=budget)
 
     CURRENT["reasoning"] = resolve_reasoning(task or CURRENT.get("request", ""))
-    max_steps = int(CFG.get("max_steps", 40))
-    budget = int(CFG.get("task_token_budget", 250000))
-    warn_pct = int(CFG.get("warn_at_budget_pct", 80))
+    max_steps = int(CFG.get("max_steps", 40)) if CFG else 40
+    warn_pct = int(CFG.get("warn_at_budget_pct", 80)) if CFG else 80
 
     step = 0
     recent_calls = []
 
-    while step < max_steps:
-        step += 1
-        TASK_STATE["steps"] += 1
+    try:
+        while step < max_steps:
+            step += 1
+            TASK_STATE["steps"] += 1
 
-        # Check token budget
-        total_tokens = USAGE["in"] + USAGE["out"]
-        if budget > 0:
-            if total_tokens >= budget:
-                warn(f"Task token budget exhausted ({total_tokens}/{budget}). Pausing task.")
-                print("  Type 'continue' to add 100k tokens, or adjust with /budget.")
-                TASK_STATE["paused"] = True
+            # Check token budget via centralized BudgetManager
+            total_tokens = BUDGET.total_task_tokens()
+            curr_b = BUDGET.task_usage.get("budget", budget)
+            if curr_b > 0:
+                if total_tokens >= curr_b:
+                    warn(f"Task token budget exhausted ({total_tokens:,}/{curr_b:,} tokens used). Pausing task.")
+                    print("  Run '/budget add <amount>' to extend allowance (e.g. /budget add 50000).")
+                    TASK_STATE["paused"] = True
+                    BUDGET.task_usage["paused"] = True
+                    return
+                elif not CURRENT.get("warned_budget") and (total_tokens / curr_b * 100) >= warn_pct:
+                    warn(f"Approaching task budget: {total_tokens:,}/{curr_b:,} tokens used ({warn_pct}%).")
+                    CURRENT["warned_budget"] = True
+
+            slim_history(messages)
+
+            w = max(40, min(term_width(), 76))
+            step_bar = f"╭── Step {step}/{max_steps} " + ("─" * max(0, w - 16 - len(str(step)) - len(str(max_steps))))
+            print(paint(f"\n{step_bar}", "cyan"))
+            set_tmux_title(f"[Step {step}/{max_steps}] Thinking...", "FlowCo:Think")
+            try:
+                resp = chat(messages)
+                msg = resp["choices"][0]["message"]
+            except Exception as exc:
+                err(f"Model communication error: {exc}")
+                log_event("error", f"API call failure at step {step}: {exc}")
+                set_tmux_title("API Error", "FlowCo:Error")
                 return
-            elif not CURRENT["warned_budget"] and (total_tokens / budget * 100) >= warn_pct:
-                warn(f"Approaching task budget: {total_tokens}/{budget} tokens used ({warn_pct}%).")
-                CURRENT["warned_budget"] = True
 
-        slim_history(messages)
+            messages.append(msg)
+            tool_calls = msg.get("tool_calls") or []
 
-        w = max(40, min(term_width(), 76))
-        step_bar = f"╭── Step {step}/{max_steps} " + ("─" * max(0, w - 16 - len(str(step)) - len(str(max_steps))))
-        print(paint(f"\n{step_bar}", "cyan"))
-        set_tmux_title(f"[Step {step}/{max_steps}] Thinking...", "FlowCo:Think")
-        try:
-            resp = chat(messages)
-            msg = resp["choices"][0]["message"]
-        except Exception as exc:
-            err(f"Model communication error: {exc}")
-            log_event("error", f"API call failure at step {step}: {exc}")
-            set_tmux_title("API Error", "FlowCo:Error")
-            return
+            if not tool_calls:
+                # No further tool calls - task turn finished
+                content = msg.get("content", "").strip()
+                if content and not resp.get("streamed_live"):
+                    print(f"\n{content}\n")
+                elif content:
+                    print()
+                TASK_STATE["status"] = "idle"
+                set_tmux_title(f"Idle ({WORK.name})", "FlowCo:Idle")
+                tmux_notify(f"Task finished in {step} steps.")
+                return
 
-        messages.append(msg)
-        tool_calls = msg.get("tool_calls") or []
+            # Execute tool calls
+            for tc in tool_calls:
+                fn_info = tc.get("function") or {}
+                fn_name = fn_info.get("name", "")
+                raw_args = fn_info.get("arguments", "{}")
+                args = clean_args(fn_name, parse_args(raw_args))
 
-        if not tool_calls:
-            # No further tool calls - task turn finished
-            content = msg.get("content", "").strip()
-            if content and not resp.get("streamed_live"):
-                print(f"\n{content}\n")
-            elif content:
-                print()
-            TASK_STATE["status"] = "idle"
-            set_tmux_title(f"Idle ({WORK.name})", "FlowCo:Idle")
-            tmux_notify(f"Task finished in {step} steps.")
-            return
+                # Loop detection
+                call_sig = (fn_name, json.dumps(args, sort_keys=True))
+                recent_calls.append(call_sig)
+                if len(recent_calls) >= 3 and recent_calls[-1] == recent_calls[-2] == recent_calls[-3]:
+                    warn(f"Repetitive call detected for {fn_name}. Breaking loop.")
+                    tool_output = "Error: Repeated identical tool call without progress. Try a different approach."
+                elif fn_name in TOOL_FUNCS:
+                    summary_args = clip(json.dumps(args, ensure_ascii=False), 50)
+                    print(paint(f"  ┌── {ICONS['bolt']} {fn_name}", "cyan", "bold") + dim(f"({summary_args})"))
+                    set_tmux_title(f"[{fn_name}] {clip(json.dumps(args), 25)}", f"FlowCo:{fn_name}")
+                    t0 = time.time()
+                    try:
+                        tool_output = TOOL_FUNCS[fn_name](**args)
+                    except KeyboardInterrupt:
+                        tool_output = "Error: Tool execution interrupted by user (Ctrl+C)."
+                        warn("Tool interrupted by user.")
+                    except Exception as exc:
+                        tool_output = f"Error executing {fn_name}: {exc}"
+                    dt = time.time() - t0
+                    TASK_STATE["tools"] += 1
 
-        # Execute tool calls
-        for tc in tool_calls:
-            fn_info = tc.get("function") or {}
-            fn_name = fn_info.get("name", "")
-            raw_args = fn_info.get("arguments", "{}")
-            args = clean_args(fn_name, parse_args(raw_args))
-
-            # Loop detection
-            call_sig = (fn_name, json.dumps(args, sort_keys=True))
-            recent_calls.append(call_sig)
-            if len(recent_calls) >= 3 and recent_calls[-1] == recent_calls[-2] == recent_calls[-3]:
-                warn(f"Repetitive call detected for {fn_name}. Breaking loop.")
-                tool_output = "Error: Repeated identical tool call without progress. Try a different approach."
-            elif fn_name in TOOL_FUNCS:
-                summary_args = clip(json.dumps(args, ensure_ascii=False), 50)
-                print(paint(f"  ┌── {ICONS['bolt']} {fn_name}", "cyan", "bold") + dim(f"({summary_args})"))
-                set_tmux_title(f"[{fn_name}] {clip(json.dumps(args), 25)}", f"FlowCo:{fn_name}")
-                t0 = time.time()
-                try:
-                    tool_output = TOOL_FUNCS[fn_name](**args)
-                except KeyboardInterrupt:
-                    tool_output = "Error: Tool execution interrupted by user (Ctrl+C)."
-                    warn("Tool interrupted by user.")
-                except Exception as exc:
-                    tool_output = f"Error executing {fn_name}: {exc}"
-                dt = time.time() - t0
-                TASK_STATE["tools"] += 1
-
-                if is_error(tool_output):
-                    TASK_STATE["errors"] += 1
-                    print(paint(f"  └── {ICONS['cross']} Error ({dt:.2f}s)", "red", "bold"))
-                    err_preview = str(tool_output).splitlines()[0] if str(tool_output) else "Error"
-                    print(paint(f"      {clip(err_preview, 72)}", "red"))
+                    if is_error(tool_output):
+                        TASK_STATE["errors"] += 1
+                        print(paint(f"  └── {ICONS['cross']} Error ({dt:.2f}s)", "red", "bold"))
+                        err_preview = str(tool_output).splitlines()[0] if str(tool_output) else "Error"
+                        print(paint(f"      {clip(err_preview, 72)}", "red"))
+                    else:
+                        print(paint(f"  └── {ICONS['check']} Success ({dt:.2f}s)", "green", "bold"))
                 else:
-                    print(paint(f"  └── {ICONS['check']} Success ({dt:.2f}s)", "green", "bold"))
-            else:
-                tool_output = f"Error: unknown tool '{fn_name}'."
+                    tool_output = f"Error: unknown tool '{fn_name}'."
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.get("id") or new_call_id(),
-                "name": fn_name,
-                "content": clip(str(tool_output), MAX_TOOL_OUTPUT),
-            })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id") or new_call_id(),
+                    "name": fn_name,
+                    "content": clip(str(tool_output), MAX_TOOL_OUTPUT),
+                })
+    except KeyboardInterrupt:
+        if messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls"):
+            tool_ids_called = [tc["id"] for tc in messages[-1].get("tool_calls") if tc.get("id")]
+            fulfilled_ids = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+            for uid in tool_ids_called:
+                if uid not in fulfilled_ids:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": uid,
+                        "name": "interrupted",
+                        "content": "Execution interrupted by user (Ctrl+C).",
+                    })
+        warn("Task execution interrupted by user (Ctrl+C).")
+        set_tmux_title("Idle", "FlowCo:Idle")
 
 
 # ===========================================================================
@@ -4313,6 +5053,7 @@ def cmd_testapi() -> bool:
 
     print(dim("  Pinging active provider..."))
     t0 = time.time()
+    BUDGET.record_request_start(caller="diagnostic")
     try:
         body = {
             "model": CFG.get("model", DEFAULT_MODEL),
@@ -4325,13 +5066,16 @@ def cmd_testapi() -> bool:
             data = json.load(resp)
             dt = time.time() - t0
             reply = data["choices"][0]["message"].get("content", "").strip()
+            BUDGET.record_success(data.get("usage"), in_chars=20, out_chars=len(reply), caller="diagnostic")
             ok(f"Connected to {active_provider_name()} in {dt:.2f}s! Model response: '{reply}'")
             return True
     except urllib.error.HTTPError as e:
+        BUDGET.record_failure()
         detail = e.read().decode(errors="replace")[:300]
         err(f"API Error HTTP {e.code}: {detail}")
         return False
     except Exception as exc:
+        BUDGET.record_failure()
         err(f"Connection failed: {exc}")
         return False
 
@@ -4375,6 +5119,7 @@ def cmd_stream_test(prompt: str = "") -> bool:
     chunks_count = 0
     text_pieces = []
 
+    BUDGET.record_request_start(caller="diagnostic")
     try:
         req = _request(body)
         try:
@@ -4436,14 +5181,17 @@ def cmd_stream_test(prompt: str = "") -> bool:
         print(f"│ {paint('Stream Protocol', 'white', 'bold')}            : " + paint("✔ PASS (Live SSE verified)", "green", "bold"))
         print(paint("╰" + "─" * max(2, w - 2), "green"))
         print()
+        BUDGET.record_success(in_chars=len(test_prompt), out_chars=char_count, caller="diagnostic")
         return True
 
     except urllib.error.HTTPError as e:
+        BUDGET.record_failure()
         err_msg = e.read().decode(errors="replace")[:400]
         print(paint(f"\n╰{'─' * max(2, w - 2)}", "red"))
         err(f"Stream Benchmark failed (HTTP {e.code}): {err_msg}")
         return False
     except Exception as exc:
+        BUDGET.record_failure()
         print(paint(f"\n╰{'─' * max(2, w - 2)}", "red"))
         err(f"Stream Benchmark failed: {exc}")
         return False
@@ -4459,6 +5207,7 @@ def cmd_help(category: str = "") -> None:
     commands = [
         ("Provider & Models", [
             ("/apipro [switch <name>]", "Open provider manager or switch profiles"),
+            ("/local [use <preset>]", "Scan & auto-switch to local models (Ollama, llama.cpp, LM Studio, vLLM)"),
             ("/models [filter]", "Fetch and list available models from endpoint"),
             ("/model <id>", "Set active model ID"),
             ("/coder [model|off]", "Configure secondary coder model"),
@@ -4475,7 +5224,7 @@ def cmd_help(category: str = "") -> None:
             ("/github <repo> [type]", "Download or clone repo/release/file from GitHub"),
             ("/workspace [path]", "Inspect or change active workplace folder on internal storage"),
             ("/tasks", "View structured task execution graph (DAG)"),
-            ("/bg", "List running background processes"),
+            ("/bg [kill <id>|clear]", "List, inspect, kill, or clear background tasks"),
             ("/skills", "View learned rules and persisted skill library"),
             ("/run <command>", "Run shell command in sandbox"),
             ("/undo [file] [idx]", "Restore file from automatic snapshot backups"),
@@ -4494,6 +5243,7 @@ def cmd_help(category: str = "") -> None:
         ]),
         ("System & Maintenance", [
             ("/status", "Display complete agent system status"),
+            ("/sandbox [local|proot|off|auto]", "Inspect or configure command sandbox isolation"),
             ("/doctor", "Run local diagnostics on environment and permissions"),
             ("/logs [n]", "View recent events from flowco.log"),
             ("/clear", "Clear console screen and re-render header"),
@@ -4601,10 +5351,169 @@ def cmd_tasks() -> None:
     print()
 
 
-def cmd_bg() -> None:
-    """Display active background tasks."""
-    section("Background Async Tasks")
-    print(tool_task_status())
+def cmd_bg(arg: str = "") -> None:
+    """Display active background tasks or manage them: /bg, /bg kill <id>, /bg clear."""
+    arg = (arg or "").strip()
+    if not arg:
+        section("Background Async Tasks")
+        print(tool_task_status())
+        print()
+        return
+
+    parts = arg.split(maxsplit=1)
+    subcmd = parts[0].lower()
+    if subcmd == "kill" and len(parts) > 1:
+        tid = parts[1].strip()
+        res = tool_kill_task(tid)
+        info(res)
+    elif subcmd == "clear":
+        to_del = [tid for tid, t in BACKGROUND_TASKS.items() if not t.get("proc") or t["proc"].poll() is not None]
+        for tid in to_del:
+            t = BACKGROUND_TASKS.pop(tid, None)
+            if t and t.get("handle"):
+                try:
+                    t["handle"].close()
+                except Exception:
+                    pass
+        ok(f"Cleared {len(to_del)} completed background task(s).")
+    else:
+        if arg in BACKGROUND_TASKS:
+            print(tool_task_status(arg))
+        else:
+            print("Usage: /bg [kill <id> | clear | <task_id>]")
+
+
+def cmd_sandbox(arg: str = "") -> None:
+    """Inspect or configure command execution sandbox mode."""
+    parts = (arg or "").strip().split()
+    if parts:
+        sub = parts[0].lower()
+        if sub in ("local", "proot", "off", "auto"):
+            CFG["sandbox"] = sub
+            save_config()
+            setup_sandbox()
+            if sub == "local":
+                warn("Restricted local execution enabled.")
+                print(dim("  Note: No OS container isolation; path boundary guards are active."))
+            else:
+                ok(f"Sandbox mode set to: {sub} ({SANDBOX.get('note', '')})")
+        else:
+            err("Usage: /sandbox [local|proot|off|auto]")
+    else:
+        info(f"Current sandbox mode: {SANDBOX.get('mode')} - {SANDBOX.get('note')}")
+        print(dim("  Options: /sandbox local, /sandbox proot, /sandbox off, /sandbox auto\n"))
+
+
+def scan_local_models() -> dict:
+    """Scan local ports (Ollama, llama.cpp, LM Studio, vLLM) for running servers and models."""
+    candidates = [
+        ("ollama", "Ollama", "http://127.0.0.1:11434"),
+        ("llamacpp", "llama.cpp", "http://127.0.0.1:8080"),
+        ("lmstudio", "LM Studio", "http://127.0.0.1:1234"),
+        ("vllm", "vLLM / LocalAI", "http://127.0.0.1:8000"),
+    ]
+    discovered = {}
+    for key, name, base_url in candidates:
+        models = []
+        is_up = False
+        try:
+            req = urllib.request.Request(f"{base_url}/v1/models", headers={"User-Agent": "FlowCo/5.0"})
+            with urllib.request.urlopen(req, timeout=0.6) as resp:
+                if resp.status == 200:
+                    is_up = True
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                    for m in data.get("data") or []:
+                        m_id = m.get("id")
+                        if m_id:
+                            models.append(m_id)
+        except Exception:
+            pass
+
+        if not is_up and key == "ollama":
+            try:
+                req = urllib.request.Request(f"{base_url}/api/tags", headers={"User-Agent": "FlowCo/5.0"})
+                with urllib.request.urlopen(req, timeout=0.6) as resp:
+                    if resp.status == 200:
+                        is_up = True
+                        data = json.loads(resp.read().decode("utf-8", "replace"))
+                        for m in data.get("models") or []:
+                            m_name = m.get("name")
+                            if m_name:
+                                models.append(m_name)
+            except Exception:
+                pass
+
+        if is_up:
+            discovered[key] = {
+                "name": name,
+                "base_url": f"{base_url}/v1",
+                "models": models,
+            }
+    return discovered
+
+
+def cmd_local(arg: str = "") -> None:
+    """Discover, test, and activate local models running on-device (Ollama, llama.cpp, LM Studio, vLLM)."""
+    arg = (arg or "").strip()
+    parts = arg.split()
+    subcmd = parts[0].lower() if parts else ""
+
+    if subcmd in ("use", "switch") and len(parts) > 1:
+        preset = parts[1].lower()
+        if preset not in PROVIDER_PRESETS:
+            err(f"Unknown preset '{preset}'. Choose from: {', '.join(k for k in PROVIDER_PRESETS if is_local_endpoint(PROVIDER_PRESETS[k].get('base_url', '')))}")
+            return
+        pinfo = PROVIDER_PRESETS[preset]
+        model_name = parts[2] if len(parts) > 2 else pinfo.get("default_model", "default")
+        CFG["base_url"] = pinfo["base_url"]
+        CFG["model"] = model_name
+        CFG["active_provider"] = preset
+        if "providers" not in CFG:
+            CFG["providers"] = {}
+        CFG["providers"][preset] = {
+            "label": pinfo["label"],
+            "base_url": pinfo["base_url"],
+            "model": model_name,
+            "api_key": "",
+        }
+        save_config()
+        ok(f"Switched to local provider: {pinfo['label']} ({model_name})")
+        return
+
+    section("Local On-Device Model Scanner")
+    info("Scanning local endpoints (127.0.0.1: 11434, 8080, 1234, 8000)...")
+    found = scan_local_models()
+
+    if not found:
+        print()
+        warn("No active local model servers detected on standard loopback ports.")
+        print(dim("  Supported local engines for Android Termux & Linux:"))
+        print(dim("    * Ollama:           ollama serve            (http://127.0.0.1:11434/v1)"))
+        print(dim("    * llama.cpp:        llama-server -m <gguf>  (http://127.0.0.1:8080/v1)"))
+        print(dim("    * LM Studio:        Start Local Server      (http://127.0.0.1:1234/v1)"))
+        print(dim("    * vLLM / LocalAI:   vllm serve ...          (http://127.0.0.1:8000/v1)"))
+        print()
+        print(dim("  To configure manually anyway: /local use <ollama|llamacpp|lmstudio|vllm|local> [model]"))
+        return
+
+    print()
+    ok(f"Detected {len(found)} active local server(s):")
+    for key, info_dict in found.items():
+        print(f"  * {bold(info_dict['name'])} [{key}] at {dim(info_dict['base_url'])}")
+        if info_dict["models"]:
+            print("    Available models:")
+            for m in info_dict["models"][:8]:
+                print(f"      - {m}")
+            if len(info_dict["models"]) > 8:
+                print(f"      ... and {len(info_dict['models']) - 8} more")
+        else:
+            print("    Models: (server responsive, no models explicitly listed)")
+
+    print()
+    print(paint("  Quick activation:", "cyan"))
+    for key, info_dict in found.items():
+        default_m = info_dict["models"][0] if info_dict["models"] else "default"
+        print(f"    /local use {key} {default_m}")
     print()
 
 
@@ -4752,7 +5661,15 @@ def cmd_wipe(target: str = "") -> None:
             return
         print(paint(f"  ALL FILES IN {WORK} WILL BE PERMANENTLY REMOVED!", "red", "bold"))
 
-    ans = input("  Type 'yes' to confirm destruction: ").strip()
+    if os.environ.get("FLOWCO_YES") == "1":
+        ans = "yes"
+    else:
+        try:
+            ans = input("  Type 'yes' to confirm destruction: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            info("Wipe cancelled.")
+            return
+
     if ans != "yes":
         info("Wipe cancelled.")
         return
@@ -4771,6 +5688,8 @@ def cmd_wipe(target: str = "") -> None:
         if CONFIG_FILE.is_file():
             CONFIG_FILE.unlink(missing_ok=True)
             count += 1
+        CFG.clear()
+        CFG.update(DEFAULT_CONFIG)
     if target in ("workspace", "all"):
         for item in WORK.iterdir():
             if item.name in (".git",):
@@ -4792,6 +5711,7 @@ def cmd_shutdown() -> None:
     print()
     info("Shutting down FlowCo...")
     stop_servers()
+    stop_background_tasks()
     save_config()
     ok("Clean shutdown complete. Goodbye!")
     sys.exit(0)
@@ -4801,6 +5721,7 @@ def cmd_restart() -> None:
     """Gracefully restart the FlowCo process."""
     info("Restarting FlowCo...")
     stop_servers()
+    stop_background_tasks()
     save_config()
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -4810,11 +5731,11 @@ def cmd_restart() -> None:
 # ===========================================================================
 
 def run_selftest() -> int:
-    """Comprehensive offline unit test suite for FlowCo v4."""
+    """Comprehensive offline unit test suite for FlowCo v5.0."""
     import tempfile
     print()
     print(bold("=================================================="))
-    print(bold("        FlowCo v4 Offline Self-Test Suite         "))
+    print(bold("        FlowCo v5.0 Offline Self-Test Suite       "))
     print(bold("=================================================="))
 
     passed, failed = 0, 0
@@ -4993,10 +5914,14 @@ def run_selftest() -> int:
                 tool_task_graph("init")
                 tool_task_graph("add", task_id="sub1", title="Scrape documentation")
                 tool_task_graph("add", task_id="sub2", title="Compile code", depends_on="sub1")
+                # Prior to sub1 completion, sub2 is PENDING
+                c1 = tool_task_graph("show")
+                assert "[PENDING] sub2: Compile code [needs: sub1]" in c1
+                # When sub1 is DONE, DAG scheduler automatically transitions sub2 to READY
                 tool_task_graph("update", task_id="sub1", status="DONE")
                 chart = tool_task_graph("show")
                 assert "[DONE] sub1: Scrape documentation" in chart
-                assert "[PENDING] sub2: Compile code [needs: sub1]" in chart
+                assert "[READY] sub2: Compile code [needs: sub1]" in chart
                 assert "50%" in chart
             test("Task graph DAG and dependency management", t_task_graph)
 
@@ -5072,6 +5997,18 @@ def run_selftest() -> int:
             SANDBOX.clear()
             SANDBOX.update(old_sandbox)
 
+    # Discover and run modular test suite from tests/
+    import unittest
+    tests_dir = Path(__file__).resolve().parent / "tests"
+    if tests_dir.is_dir():
+        print(bold("\n--- Running Modular Unit Tests (tests/) ---"))
+        loader = unittest.TestLoader()
+        suite = loader.discover(str(tests_dir))
+        runner = unittest.TextTestRunner(verbosity=1)
+        res = runner.run(suite)
+        passed += (res.testsRun - len(res.failures) - len(res.errors))
+        failed += (len(res.failures) + len(res.errors))
+
     print(bold("--------------------------------------------------"))
     print(f"Results: {passed} passed, {failed} failed.")
     return 0 if failed == 0 else 1
@@ -5088,10 +6025,11 @@ def setup_readline() -> None:
         commands = [
             "/help", "/status", "/stream-test", "/tasks", "/bg", "/skills",
             "/doctor", "/testapi", "/undo", "/files", "/download", "/github",
-            "/workspace", "/workplace", "/models", "/model", "/coder", "/effort",
-            "/think", "/budget", "/cost", "/memory", "/compact", "/history",
-            "/export", "/logs", "/servers", "/stop", "/run", "/wipe",
-            "/shutdown", "/restart", "/reset", "/clear", "/quit", "/exit"
+            "/workspace", "/workplace", "/local", "/apipro", "/models", "/model",
+            "/coder", "/effort", "/think", "/budget", "/cost", "/memory",
+            "/compact", "/history", "/export", "/logs", "/servers", "/stop",
+            "/run", "/sandbox", "/wipe", "/shutdown", "/restart", "/reset",
+            "/clear", "/quit", "/exit"
         ]
 
         def completer(text, state):
@@ -5179,6 +6117,8 @@ class FlowCoSlashCompleter(_BASE_COMPLETER):
         ('/status', 'Show workspace, tokens & budget'),
         ('/stream-test', 'Benchmark real-time token streaming'),
         ('/testapi', 'Quick ping test of active provider'),
+        ('/local', 'Scan & switch to local models (Ollama, llama.cpp, etc.)'),
+        ('/apipro', 'Manage or switch API provider profiles'),
         ('/tasks', 'View visual task graph & DAG'),
         ('/bg', 'Manage async background processes'),
         ('/skills', 'View and manage learned rules'),
@@ -5198,10 +6138,10 @@ class FlowCoSlashCompleter(_BASE_COMPLETER):
         ('/compact', 'Compact session memory context'),
         ('/history', 'Display recent conversation turns'),
         ('/export', 'Export conversation to markdown file'),
-        ('/logs', 'Display system event logs'),
         ('/servers', 'View background dev servers'),
         ('/stop', 'Stop background dev servers'),
         ('/run', 'Execute bash command in workspace'),
+        ('/sandbox', 'Inspect or set command isolation mode'),
         ('/wipe', 'Safely delete temporary files'),
         ('/reset', 'Reset conversation history & plan'),
         ('/clear', 'Clear terminal console screen'),
@@ -5436,8 +6376,9 @@ def main() -> None:
         elif cmd in ("/tasks", "/dag"):
             cmd_tasks()
             continue
-        elif cmd in ("/bg", "/jobs"):
-            cmd_bg()
+        elif cmd.startswith("/bg") or cmd.startswith("/jobs"):
+            parts = user.split(None, 1)
+            cmd_bg(parts[1] if len(parts) > 1 else "")
             continue
         elif cmd in ("/skills", "/learn"):
             cmd_skills()
@@ -5495,29 +6436,78 @@ def main() -> None:
             cmd_reasoning(parts[1] if len(parts) > 1 else "")
             continue
         elif cmd == "/cost":
-            in_t, out_t = USAGE["in"], USAGE["out"]
-            p_in = float(CFG.get("price_in_per_m", 0.0))
-            p_out = float(CFG.get("price_out_per_m", 0.0))
-            cost = (in_t / 1e6 * p_in) + (out_t / 1e6 * p_out)
-            print(f"\nTokens: {in_t:,} in, {out_t:,} out ({USAGE['calls']} calls)")
-            if p_in or p_out:
-                print(f"Estimated Cost: ${cost:.4f}")
+            in_t = BUDGET.session_usage["prompt_tokens"]
+            out_t = BUDGET.session_usage["completion_tokens"]
+            cached_t = BUDGET.session_usage["cached_tokens"]
+            p_in = float(CFG.get("price_in_per_m", 0.0) or 0.0)
+            p_out = float(CFG.get("price_out_per_m", 0.0) or 0.0)
+            p_cached = float(CFG.get("price_cache_read_per_m", 0.0) or 0.0)
+
+            print(paint("\n╭─ 💳 API Cost & Token Ledger ────────────────────────────────", "green", "bold"))
+            print(f"│ Session Requests : {BUDGET.session_usage['requests']} calls ({BUDGET.session_usage['retries']} retries)")
+            print(f"│ Normal Input     : {in_t:,} tokens")
+            print(f"│ Cached Input     : {cached_t:,} tokens")
+            print(f"│ Output Tokens    : {out_t:,} tokens")
+            print(f"│ Current Task     : {BUDGET.total_task_tokens():,} tokens consumed")
+
+            if p_in > 0 or p_out > 0:
+                rates = {"price_in_per_m": p_in, "price_out_per_m": p_out, "price_cache_read_per_m": p_cached}
+                cost = calculate_cost(in_t, out_t, cached_t, rates)
+                print(f"│ Estimated Cost   : ${cost:.4f}")
             else:
-                print(dim("Tip: configure price_in_per_m / price_out_per_m to track dollars."))
-            print()
+                print(f"│ Estimated Cost   : Unknown (configure price_in_per_m / price_out_per_m)")
+            print(paint("╰─────────────────────────────────────────────────────────────\n", "green"))
             continue
         elif cmd.startswith("/budget"):
-            parts = user.split(None, 1)
-            if len(parts) > 1:
+            subparts = user.split()
+            if len(subparts) >= 3 and subparts[1].lower() == "add":
                 try:
-                    CFG["task_token_budget"] = int(parts[1].strip())
-                    save_config()
-                    ok(f"Task token budget set to: {CFG['task_token_budget']:,}")
+                    added = int(subparts[2])
+                    if added <= 0:
+                        err("Additional budget tokens must be greater than zero.")
+                    else:
+                        new_total = BUDGET.add_budget(added)
+                        TASK_STATE["paused"] = False
+                        CFG["task_token_budget"] = new_total
+                        save_config()
+                        ok(f"Added {added:,} tokens! New task budget: {new_total:,} tokens (Remaining: {BUDGET.remaining_task_budget():,}).")
                 except ValueError:
-                    err("Budget must be a whole number of tokens.")
+                    err("Invalid token amount. Usage: /budget add 50000")
+            elif len(subparts) == 2:
+                try:
+                    val = int(subparts[1])
+                    if val < 0:
+                        err("Budget cannot be negative.")
+                    else:
+                        CFG["task_token_budget"] = val
+                        BUDGET.task_usage["budget"] = val
+                        if val > BUDGET.total_task_tokens():
+                            TASK_STATE["paused"] = False
+                            BUDGET.task_usage["paused"] = False
+                        save_config()
+                        ok(f"Task token budget set to: {val:,} tokens (Remaining: {BUDGET.remaining_task_budget():,}).")
+                except ValueError:
+                    err("Usage: /budget <amount> or /budget add <amount>")
             else:
-                b = CFG.get("task_token_budget", 0)
-                info(f"Current task token budget: {b:,}" if b else "Budget is currently unlimited.")
+                tb = BUDGET.task_usage.get("budget", CFG.get("task_token_budget", 0))
+                used = BUDGET.total_task_tokens()
+                rem = BUDGET.remaining_task_budget()
+                sess_used = BUDGET.total_session_tokens()
+                print(paint("\n╭─ 💰 Token Spending & Budget Status ─────────────────────────", "cyan", "bold"))
+                print(f"│ Task Budget     : {tb:,} tokens" if tb else "│ Task Budget     : Unlimited")
+                print(f"│ Task Consumed   : {used:,} tokens")
+                print(f"│ Remaining Task  : {rem:,} tokens" if tb else "│ Remaining Task  : Unlimited")
+                print(f"│ Session Usage   : {sess_used:,} tokens ({BUDGET.session_usage['requests']} requests)")
+                print(paint("╰─────────────────────────────────────────────────────────────", "cyan"))
+                print(dim("  Extend allowance: /budget add <amount> (e.g. /budget add 50000)\n"))
+            continue
+        elif cmd.startswith("/sandbox"):
+            parts = user.split(None, 1)
+            cmd_sandbox(parts[1] if len(parts) > 1 else "")
+            continue
+        elif cmd.startswith("/local"):
+            parts = user.split(None, 1)
+            cmd_local(parts[1] if len(parts) > 1 else "")
             continue
         elif cmd == "/servers":
             if not SERVERS:
