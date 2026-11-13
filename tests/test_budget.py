@@ -10,10 +10,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import flowco
+from support import FlowCoTestCase
 
 
-class TestBudgetManager(unittest.TestCase):
+class TestBudgetManager(FlowCoTestCase):
     def setUp(self):
+        super().setUp()
         self.bm = flowco.BudgetManager()
         flowco.BUDGET = self.bm
 

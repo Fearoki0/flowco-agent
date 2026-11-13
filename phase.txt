@@ -1,0 +1,379 @@
+FLOWCO v5.0 — STRICT IMPLEMENTATION AND EXECUTION PROTOCOL
+
+You must follow this protocol while implementing the complete FlowCo v5.0 engineering overhaul.
+
+This protocol takes priority over convenience, speed, and unnecessary feature additions.
+
+Your objective is to produce a working, tested, stable implementation without destroying existing functionality or wasting API tokens.
+
+1. NEVER PERFORM A BLIND FULL REWRITE
+
+Do not immediately rewrite "flowco.py" or replace the entire repository.
+
+First understand the existing architecture.
+
+Before modifying anything:
+
+- Inspect the Git status.
+- Identify uncommitted changes.
+- Inspect the relevant source files.
+- Understand function dependencies.
+- Identify existing functionality.
+- Identify potential regressions.
+
+Preserve all existing user modifications.
+
+Make changes incrementally.
+
+If a modular refactor is necessary, perform it gradually and verify compatibility after each step.
+
+2. USE STRICT PRIORITY LEVELS
+
+Work according to these priorities.
+
+P0 — Critical reliability and safety
+
+These must be completed before implementing new advanced features.
+
+1. Centralized token-budget enforcement.
+2. Accurate API usage accounting.
+3. Separate task and session usage.
+4. Subagent budget enforcement.
+5. Correct budget continuation.
+6. Consistent command confirmation.
+7. Safe sandbox fallback behavior.
+8. Workspace path protection.
+9. Safe "/wipe" implementation.
+10. Reliable file backups and recovery.
+
+Do not proceed to expensive architectural improvements while these systems remain broken.
+
+P1 — Agent architecture
+
+After P0 passes its tests:
+
+1. Improve the main agent loop.
+2. Improve tool dispatch.
+3. Improve context management.
+4. Improve subagent permissions.
+5. Improve task dependency execution.
+6. Improve background job management.
+7. Improve verification.
+8. Improve error recovery.
+9. Improve loop detection.
+
+P2 — API and provider engine
+
+After P1:
+
+1. Improve provider compatibility.
+2. Fix streaming.
+3. Improve retry handling.
+4. Normalize token usage.
+5. Improve cached-token accounting.
+6. Improve cost calculation.
+7. Improve model discovery.
+8. Improve reasoning parameter compatibility.
+
+P3 — Interface and Android experience
+
+After P2:
+
+1. Improve terminal UI.
+2. Improve command input.
+3. Improve status reporting.
+4. Improve Termux compatibility.
+5. Fix installation.
+6. Fix launcher paths.
+7. Improve documentation.
+
+Do not prioritize cosmetic improvements over critical correctness.
+
+3. COMPLETE EACH PHASE BEFORE MOVING FORWARD
+
+Use this development cycle for every phase:
+
+INSPECT → PLAN → IMPLEMENT → TEST → REVIEW → FIX → VERIFY
+
+For each phase:
+
+1. Identify the exact files involved.
+2. Identify the problem.
+3. Implement the smallest reliable solution.
+4. Run relevant offline tests.
+5. Inspect the resulting changes.
+6. Fix regressions.
+7. Record the results.
+8. Move to the next phase only when the required checks pass.
+
+Do not mark a phase complete merely because code was written.
+
+If a test fails, investigate and fix the underlying issue.
+
+If a test cannot run because of environmental limitations, explicitly report that limitation.
+
+4. TEST BEFORE USING REAL API CREDITS
+
+This is extremely important.
+
+Do not use my real API credits for ordinary development tests.
+
+Create and use offline tests wherever possible.
+
+Use:
+
+- Mock API responses.
+- Mock providers.
+- Mock token usage.
+- Simulated HTTP errors.
+- Local temporary directories.
+- Fake tool calls.
+- Controlled subprocess tests.
+- Local test servers.
+
+The following must work without a real API account:
+
+- Token accounting.
+- Budget enforcement.
+- Subagent limits.
+- Provider configuration.
+- Streaming parsing.
+- Tool dispatch.
+- File editing.
+- Backup and undo.
+- Workspace protection.
+- Command permission checks.
+- Task scheduling.
+- Context compaction.
+
+Real API tests must be optional and explicitly authorized.
+
+Never silently make expensive API requests during testing.
+
+5. CREATE A HARD TOKEN-SPENDING SAFETY SYSTEM
+
+Before connecting any API provider, verify the following.
+
+- Every model request passes through the central budget manager.
+- Subagents share the same budget.
+- Retries are counted.
+- Streaming requests are counted.
+- Diagnostic requests are counted.
+- No alternate API-calling function bypasses accounting.
+- Session usage is not reset when a new task starts.
+- Task usage resets correctly for a new task.
+- Budget extension requires explicit authorization.
+- Budget exhaustion stops additional model requests.
+
+Add a testing mode that simulates API usage without making network requests.
+
+Example:
+
+"FLOWCO_TEST_MODE=1"
+
+In this mode, use deterministic mock responses and simulated token counts.
+
+The test mode must not accidentally fall back to real API calls.
+
+Also implement a configurable maximum API request count.
+
+A token budget alone is insufficient because providers may report usage late or omit it entirely.
+
+6. NO UNNECESSARY SUBAGENT SPAWNING
+
+Do not use multiple agents for every task.
+
+Use the main coding agent for straightforward changes.
+
+Only delegate when:
+
+- The task is genuinely complex.
+- Independent investigation is useful.
+- Separate responsibilities can be defined.
+- The additional API cost is justified.
+
+For large tasks, prefer a small number of focused subagents.
+
+Each subagent must have:
+
+- A specific objective.
+- A limited context.
+- Restricted tool permissions.
+- A request limit.
+- A token limit.
+- An execution timeout.
+- A concise output requirement.
+
+Never allow subagents to create uncontrolled recursive subagents.
+
+Never allow parallel modifications to the same files without conflict handling.
+
+7. PREVENT TOKEN WASTE DURING DEVELOPMENT
+
+Use efficient engineering practices.
+
+- Do not repeatedly reread unchanged files.
+- Do not repeatedly inspect the entire repository.
+- Avoid sending enormous file contents to the model.
+- Use targeted code searches.
+- Use relevant excerpts.
+- Keep implementation summaries.
+- Avoid unnecessary reasoning calls.
+- Avoid repeating completed work.
+- Avoid regenerating entire files for small changes.
+- Reuse existing functionality where appropriate.
+
+Before every significant model request, consider whether the required information is already available.
+
+Do not repeatedly ask subagents to investigate something already investigated.
+
+8. PRESERVE THE ORIGINAL PROJECT
+
+The following rules are mandatory:
+
+- Never delete existing user files unnecessarily.
+- Never overwrite user configuration.
+- Never delete existing API profiles.
+- Never erase learned skills.
+- Never reset usage history without authorization.
+- Never overwrite unrelated project files.
+- Never remove useful existing commands.
+- Never silently change the license.
+- Never automatically commit or push changes.
+
+Create backups before high-risk modifications.
+
+Inspect "git diff" regularly.
+
+Keep changes limited to the intended engineering overhaul.
+
+9. TESTING GATES
+
+Before proceeding from one priority level to another, require these checks.
+
+P0 completion gate
+
+- Budget unit tests pass.
+- Usage accounting tests pass.
+- Subagent budget tests pass.
+- Command confirmation tests pass.
+- Sandbox fallback tests pass.
+- Workspace security tests pass.
+- Wipe safety tests pass.
+- File backup and restore tests pass.
+
+P1 completion gate
+
+- Tool dispatcher tests pass.
+- Context-management tests pass.
+- Task dependency tests pass.
+- Background process tests pass.
+- Verification tests pass.
+- Cancellation tests pass.
+- Subagent permission tests pass.
+
+P2 completion gate
+
+- Provider configuration tests pass.
+- API normalization tests pass.
+- Streaming tests pass.
+- Retry tests pass.
+- Cost calculation tests pass.
+- Model discovery fallback tests pass.
+
+P3 completion gate
+
+- Terminal fallback works.
+- Narrow terminal layout works.
+- Termux paths work.
+- Launcher behavior works.
+- Documentation matches actual functionality.
+- Installation requirements are correct.
+
+A failed gate must be investigated before continuing.
+
+10. CONTROLLED FAILURE HANDLING
+
+If something cannot be implemented reliably:
+
+1. Do not fake the implementation.
+2. Do not silently remove the feature.
+3. Do not bypass existing safety checks.
+4. Document the limitation.
+5. Implement a safe fallback where possible.
+6. Add a test covering the fallback.
+
+Prefer a smaller, working implementation over a large, unreliable one.
+
+11. FINAL VALIDATION
+
+Before declaring FlowCo v5.0 complete:
+
+- Run the complete offline test suite.
+- Run the existing self-test.
+- Check all imports.
+- Check syntax.
+- Check configuration migrations.
+- Check launcher paths.
+- Check command registration.
+- Check provider switching.
+- Check budget enforcement across every model-calling path.
+- Check for accidental API calls.
+- Check for accidental file deletion.
+- Inspect the complete Git diff.
+- Check for unfinished placeholders.
+- Check that documentation is accurate.
+
+Do not claim Android compatibility has been physically tested unless it has actually been tested on Android or Termux.
+
+12. FINAL REPORT FORMAT
+
+At the end, provide:
+
+P0 — Critical reliability
+
+- What was fixed.
+- Which tests passed.
+- Remaining issues.
+
+P1 — Agent architecture
+
+- What was improved.
+- Which tests passed.
+- Remaining issues.
+
+P2 — API engine
+
+- What was improved.
+- Which tests passed.
+- Remaining issues.
+
+P3 — User experience
+
+- What was improved.
+- Which tests passed.
+- Remaining issues.
+
+Also provide:
+
+- Files added.
+- Files modified.
+- Dependencies changed.
+- Commands for installation.
+- Commands for running tests.
+- Known limitations.
+- Exact Git changes.
+
+Clearly distinguish between implemented, tested, and unverified features.
+
+FINAL EXECUTION RULE
+
+Work incrementally, prioritize P0, and never sacrifice correctness for speed.
+
+Do not stop after planning.
+
+Do not stop after writing code.
+
+Do not use my real API credits to prove that your code works.
+
+I want FlowCo to earn the right to use real API credits by first proving its reliability through offline tests.

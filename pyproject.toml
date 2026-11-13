@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowco-agent"
+version = "6.0.0"
+description = "Portable developer agent CLI for Termux and Linux"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = []
+
+[project.optional-dependencies]
+tui = ["prompt_toolkit>=3.0"]
+
+[project.scripts]
+flowco = "flowco:main"
+
+[tool.setuptools]
+py-modules = ["flowco"]

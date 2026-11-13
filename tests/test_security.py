@@ -12,10 +12,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import flowco
+from support import FlowCoTestCase
 
 
-class TestSecurity(unittest.TestCase):
+class TestSecurity(FlowCoTestCase):
     def setUp(self):
+        super().setUp()
         self.td = tempfile.TemporaryDirectory()
         self.test_root = Path(self.td.name).resolve()
         self.orig_work = flowco.WORK

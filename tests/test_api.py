@@ -10,9 +10,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import flowco
+from support import FlowCoTestCase
 
 
-class TestApiLayer(unittest.TestCase):
+class TestApiLayer(FlowCoTestCase):
     def test_mock_test_mode(self):
         """Verify FLOWCO_TEST_MODE simulates model responses without network calls."""
         os.environ["FLOWCO_TEST_MODE"] = "1"

@@ -1,1 +1,2 @@
+# Optional interactive completion support; the core needs no pip packages.
 prompt_toolkit>=3.0.0

@@ -1,0 +1,327 @@
+FLOWCO v5.1 — TARGETED SECURITY, BUDGET & RELIABILITY HARDENING
+Repository: https://github.com/Fearoki0/flowco-agent
+Target branch: main
+Scope: Fix confirmed defects in the current implementation. Preserve the existing architecture and working features. Do NOT perform a blind rewrite.
+
+======================================================================
+ROLE AND OBJECTIVE
+======================================================================
+
+Act as a senior Python security engineer and agent-runtime maintainer working directly in the existing FlowCo repository.
+
+Inspect the CURRENT repository state first, then implement and test the fixes below. FlowCo has already received substantial v5.0/v5.1 improvements. Do not discard them, replace the application with a new framework, or create a second implementation beside the existing one.
+
+Priority order:
+P0 — close command-execution and sandbox safety gaps.
+P0 — make all model requests obey one consistent, conservative spending gate.
+P1 — repair continuation/task identity and context-compaction history integrity.
+P1 — strengthen tests so regressions cannot silently return.
+P2 — align version numbers, README claims, and actual behavior.
+
+Do not claim a security property that the implementation cannot enforce. A directory used as the current working directory is NOT an OS-level sandbox.
+
+======================================================================
+NON-NEGOTIABLE WORK RULES
+======================================================================
+
+1. INSPECT BEFORE EDITING
+- Read the current main branch and git status.
+- Inspect flowco.py, README.md, requirements.txt, run_flowco_tmux.sh, and every file under tests/.
+- Locate the exact current implementations before changing anything. Line numbers may have changed.
+- Identify the test runner and run the existing offline suite before editing.
+- Record baseline results and pre-existing failures.
+- Verify each issue against current code; do not assume this prompt's descriptions are still exact.
+
+2. PRESERVE USER WORK
+- Never delete user files, configuration, API profiles, workspace data, memory, logs, backups, or skills.
+- Never run /wipe, destructive cleanup, git reset, git clean, force checkout, or equivalent.
+- Do not overwrite unrelated files. Preserve existing uncommitted changes.
+- Do not commit, push, publish, tag, or create a release unless explicitly requested.
+- Do not change secrets, API keys, or provider settings.
+
+3. COST CONTROL
+- Do not call a paid model or external paid API for testing.
+- Do not run /testapi, /stream-test, live model capability probes, or real provider requests.
+- Use FLOWCO_TEST_MODE=1, mocks, local fake HTTP handlers, and offline unit tests.
+- Avoid unnecessary subagents and repeated whole-file dumps.
+- Tests must fail closed if they unexpectedly attempt network access.
+
+4. IMPLEMENTATION QUALITY
+- Keep the Python standard-library-first design and Termux compatibility.
+- Preserve public command names and existing behavior unless correcting a security flaw.
+- Do not add dependencies without a clear necessity.
+- Use pathlib and canonical resolved paths for path safety.
+- Use atomic writes for persistent files.
+- Do not silently hide security failures.
+- Do not claim tests passed unless they were actually run and inspected.
+
+5. WORK IN SMALL PHASES
+For each issue: create/reproduce a failing regression test, implement the smallest safe fix, run the targeted test, then run the full offline suite. Do not proceed past a failing P0 test without investigating it.
+
+======================================================================
+P0-A — CENTRALIZE ALL COMMAND EXECUTION AND APPROVAL
+======================================================================
+
+Audit every path that can launch a process or shell command, including at minimum:
+- exec_command()
+- tool_run_command()
+- tool_run_sandbox()
+- tool_run_background()
+- tool_start_server()
+- tool_verify()
+- tool_git()
+- syntax_check() and helpers that launch interpreters/utilities
+- PRoot and local execution paths
+- every subprocess.Popen / subprocess.run / os.system / shell=True call
+
+Create or strengthen ONE central execution policy/dispatcher. Every agent-invoked command must go through it and consistently enforce sandbox mode, command approval, applicable workspace/path restrictions, timeouts, process-group termination, and consistent exit-status reporting.
+
+Requirements:
+1. With confirm_commands=True, every command capable of arbitrary shell execution requires the same approval, whether foreground, background, server, verification, Git, or sandbox execution.
+2. Non-interactive execution rejects unapproved commands unless a deliberately configured explicit approval policy exists. Never silently approve merely because stdin is unavailable.
+3. FLOWCO_YES=1 and auto_confirm remain explicit opt-in overrides, never enabled by default; make their use visible in diagnostics.
+4. A read-only subagent must not receive any tool capable of arbitrary command execution. Do not classify command-running verify as read-only.
+5. Separate verification into safe file/syntax checks and command-based verification. Route the latter through the central dispatcher and approval policy.
+6. Lower-level helpers must not permit another tool to bypass approval.
+7. sandbox=off blocks every shell/process execution route, including verify, background jobs, servers, and sandbox scripts. Pure file inspection may remain available.
+8. Timeouts and Ctrl+C terminate the entire child process group; do not leave zombies/orphans.
+9. Use a consistent internal command result structure: stdout, stderr, exit code, timeout/interruption status. Adapt it to current UI at the boundary.
+10. Test with mocked subprocesses and patched stdin; no test launches destructive commands.
+
+Regression tests must cover: rejected foreground command; rejected background command; rejected server startup; rejected command-based verify; verify blocked when sandbox=off; destructive Git approval; non-interactive rejection by default; explicit FLOWCO_YES override only when set; process-group termination; and read-only subagents unable to execute commands.
+
+======================================================================
+P0-B — FIX run_sandbox SCRIPT PATH TRAVERSAL AND WRITE ORDER
+======================================================================
+
+Audit tool_run_sandbox() from input validation through script creation and execution.
+
+Current risks to verify: script_name is joined to WORK/.sandbox/scripts and written before approval. A malformed filename may escape the intended directory, and approval currently occurs after writing.
+
+Implement these protections:
+1. Validate script_name before creating directories or files.
+2. Accept only a simple filename, not a path. Reject absolute paths, separators, '.', '..', NUL bytes, control characters, traversal patterns, and unreasonable lengths. Allow only explicitly supported extensions (.py, .sh, .js) if still supported.
+3. Resolve the final target and prove it remains under the canonical scripts directory using Path.resolve() and is_relative_to() (or a compatible helper).
+4. Reject symlink-based escapes. Do not follow an attacker-created symlink to write outside scripts.
+5. Never write script_code until required approval succeeds. Show the exact target and execution action for approval where practical.
+6. Use atomic file creation/replacement; temporary files must remain inside the approved directory.
+7. Ensure this tool cannot bypass the normal execution dispatcher.
+8. Do not accept caller-controlled nested paths.
+9. Rejected approval creates or modifies no script file.
+10. Return clear errors without exposing secrets or environment values.
+
+Add tests for a normal filename, ../ traversal, absolute filename, nested path, NUL/control characters, symlink escape, rejected approval leaving no file, no file created outside the temporary test workspace, and successful execution with correct output/exit code. Use TemporaryDirectory only; never write to real Android storage or system paths.
+
+======================================================================
+P0-C — BE HONEST ABOUT SANDBOX ISOLATION
+======================================================================
+
+Inspect actual guarantees of modes auto, proot, local, isolated, and off.
+
+Setting cwd, HOME, TMPDIR, or PWD to WORK/.sandbox does not prevent a process from opening other readable/writable paths. It is workspace organization, not filesystem isolation.
+
+Requirements:
+1. Distinguish true OS-enforced isolation, PRoot containment and its limitations, workspace-scoped local execution with heuristic guards, and disabled execution.
+2. Do not label a mode "isolated" or "secure sandbox" unless it enforces a real boundary verified on the supported platform.
+3. If the current .sandbox mode only changes working directory/environment, rename it to an honest label such as "workspace" with backward-compatible config migration.
+4. Update help, settings, status, tool descriptions, and README to describe actual guarantees.
+5. If a genuinely isolated backend is requested but cannot be initialized or verified, fail closed instead of silently using unrestricted local execution.
+6. Never claim PRoot is a perfect security boundary. Document limitations accurately.
+7. Apply one execution policy to normal commands, background jobs, servers, verify, and sandbox scripts.
+8. Prevent subagents/tools from changing sandbox mode or approval policy to bypass user consent.
+9. If a mode cannot enforce the requested guarantee, reject it or explain the weaker alternative and require explicit user approval.
+
+Tests must prove policy decisions and path/process behavior, not merely assert a function returns the word "isolated". If kernel-level isolation cannot be tested on Termux CI, state that limitation and do not claim it is proven.
+
+======================================================================
+P0-D — MAKE TOKEN BUDGET ENFORCEMENT CONSERVATIVE AND CONSISTENT
+======================================================================
+
+Audit BudgetManager and every model-generation/request path, at minimum:
+- chat_stream()
+- chat_plain()
+- coder_complete()
+- subagent chat calls
+- cmd_testapi()
+- cmd_stream_test()
+- probe_model_capabilities()
+- diagnostics/discovery functions that actually make model requests
+- retries and stream fallback
+- every direct urllib request to a model/completion endpoint
+
+Requirements:
+1. Create one central request gate that every billable/model-generation request passes immediately before dispatch.
+2. No bypass based on streaming/non-streaming, main/subagent/coder/diagnostic, or mock/live mode.
+3. Apply task and session limits consistently. Define whether diagnostics consume task budget; at minimum diagnostics obey session limits and appear in accounting.
+4. Estimate input from the serialized request/messages (not just message content strings); include tool schemas and overhead where practical.
+5. Reserve output based on the full configured max_tokens/max_completion_tokens limit. max_tokens is already a token quantity; do NOT divide it by four.
+6. Reserve estimated usage before dispatch. Reconcile with actual provider usage after completion. Release or settle reservations carefully after failures depending on whether request transmission may have incurred cost; be conservative when uncertain.
+7. Prevent concurrent callers from passing the same remaining allowance. Use a lock or equivalent reservation mechanism if concurrent model calls are possible.
+8. Before every retry, verify the retry remains within budget. Retries may incur cost; account for them explicitly.
+9. Normalize provider usage variants: prompt/input, completion/output, cached input, and reasoning tokens where available. Avoid double-counting cached usage.
+10. Keep task, session, and provider scopes separate.
+11. /budget add N extends only the active task cap. It must not reset usage, session ledger, or create a new task.
+12. Validate and bound budget changes; prevent absurd/overflow values; keep config and BudgetManager consistent.
+13. If reservation exceeds remaining budget, do not send the request. Explain the shortfall and extension mechanism.
+14. Do not promise exact spending prevention when a provider doesn't expose exact usage or reservations cannot guarantee final billing. Explain estimates vs confirmed provider usage in /cost and /budget.
+15. Mock requests use the same gate/accounting logic with deterministic usage and zero network access.
+
+Critical issue to verify/fix: the current estimate resembles input_chars // 4 + max_tokens // 4. This under-reserves output because max_tokens is a token limit. Reserve the configured output allowance itself, or justify a different conservative rule from an enforceable provider-side cap.
+
+Regression tests must cover: max_tokens=8192 reserves correct allowance; refused request sends no network call; task and session caps; diagnostics; coder calls; subagent calls; retries; cached usage without double-counting; task reset preserving session/provider totals; /budget add preserving usage; concurrent reservations; and test mode never reaching urllib/socket.
+
+======================================================================
+P1-A — FIX TASK CONTINUATION IDENTITY
+======================================================================
+
+Audit CONTINUATIONS, run_turn(), CURRENT task fields, BUDGET.start_task(), /budget add, REPL dispatch, and one-shot task mode.
+
+Current risk to verify: global CONTINUATIONS and run_turn() use different aliases. "yes", "ok", or "keep going" may be handled inconsistently and reset task accounting.
+
+Requirements:
+1. Use one canonical continuation parser/helper everywhere.
+2. Distinguish a real continuation from a new task. Do not treat every "yes" or "ok" as continuation when no paused/active task is awaiting one.
+3. Continuation preserves task_id, task usage, remaining budget, plan/state, and conversation history.
+4. A new task resets only task-scoped counters/state; preserve session/provider usage.
+5. Never silently grant a fresh allowance when the prior task is paused or budget-exhausted.
+6. Budget extension resumes the same task and preserves task ID.
+7. Define/test behavior after success, interruption, API failure, and explicit /reset.
+8. Do not misclassify genuinely new user requests solely because they begin with "yes" or "ok".
+
+Test every accepted alias, new task after completed task, continuation after paused task, extension then continuation, and session-ledger preservation.
+
+======================================================================
+P1-B — FIX CONTEXT COMPACTION MESSAGE INTEGRITY
+======================================================================
+
+Audit compact(), slim_history(), message construction, and tool-call handling.
+
+Current risk to verify: compact() retains a fixed number of trailing messages. It may split an assistant message containing tool_calls from its corresponding tool responses. Providers require tool responses to match assistant tool-call declarations and IDs.
+
+Requirements:
+1. Treat each assistant tool-call message and all corresponding tool responses as one indivisible history group.
+2. Never retain a tool response without its preceding assistant tool-call declaration.
+3. Never retain a tool-call declaration while dropping required tool responses, unless interrupted and every unfulfilled call receives a valid synthetic response.
+4. Preserve system prompt at index 0.
+5. Retain newest complete conversational groups, not an arbitrary count of individual messages.
+6. Validate matching tool_call_ids, unique IDs, no orphan/duplicate responses, valid role/content shapes, and complete/pending state before sending.
+7. Preserve active user request, task goal, plan, recent file changes, verified facts, and unresolved tool results.
+8. Persist memory atomically. Do not silently swallow disk failures and claim memory was saved.
+9. Keep context bounded, but prioritize valid groups over fixed count.
+10. If valid compaction cannot be produced, keep previous valid history and report the problem. Never send malformed history.
+
+Add tests with multiple tool calls; partial/all responses; interrupted calls; KEEP_FULL boundary; tool calls at boundary; long tool outputs; repeated compaction; memory write failure; and a validator rejecting orphan/duplicate responses.
+
+======================================================================
+P1-C — SUBAGENT PERMISSION HARDENING
+======================================================================
+
+Requirements:
+1. Role permissions must be explicit and deny-by-default.
+2. Researcher/reviewer roles cannot execute shell or tools that indirectly execute shell.
+3. Split verify or permission it according to command execution capability.
+4. Disallow recursive subagent spawning by default unless a deliberate bounded hierarchy is implemented and tested.
+5. All subagent model calls use the central budget gate.
+6. All subagent tools use the same execution security checks as parent calls.
+7. Subagents cannot modify global sandbox mode, confirmation policy, provider keys, or global budgets.
+8. Enforce request limits at the central request gate, not only inside one loop.
+9. Preserve and test role-specific read/write capabilities.
+
+======================================================================
+P2 — VERSION, README, AND CLAIM CONSISTENCY
+======================================================================
+
+Inspect actual behavior and update APP_VERSION, startup banner, --version, README, test count, command reference, requirements/install instructions, and run_flowco_tmux.sh.
+
+Requirements:
+1. Use one authoritative version constant.
+2. If implementation is v5.1, update strings consistently. Do not bump to v5.2 unless implementation/tests justify it.
+3. Advertise only the actual executed test count.
+4. README claims must match behavior. Remove/qualify claims such as zero-key diagnostics if /testapi or /stream-test rejects an empty key.
+5. Describe local model support, cache behavior, PRoot, workspace mode, and true isolation honestly.
+6. Check launcher paths against actual default workspace; remove inconsistent hardcoded paths.
+7. Preserve useful install instructions and existing commands.
+
+======================================================================
+P3 — OFFLINE REGRESSION TESTS AND VALIDATION
+======================================================================
+
+Add/update tests in the existing tests/ layout. Tests must exercise behavior, not just check docstrings or keywords.
+
+Required validation:
+1. Compile flowco.py and every test module for Python syntax.
+2. Run full offline self-test (--selftest) in a clean temporary test environment.
+3. Run modular unittest discovery.
+4. Run with FLOWCO_TEST_MODE=1.
+5. Patch/mock urllib.request.urlopen and socket creation in offline tests; fail immediately on unexpected network attempts.
+6. Verify test mode returns deterministic model results without contacting a real endpoint.
+7. Test current Python runtime; preserve declared minimum Python compatibility.
+8. Inspect every subprocess call site and prove each agent-facing route uses the central policy.
+9. Check no API key, token, Authorization header, or sensitive environment value is written to logs, test output, traces, or memory.
+10. Run git diff --check, inspect complete diff and final git status; remove no user work or generated assets.
+
+Do not claim "fully secure", "unbreakable", or "production-ready". Report only demonstrated guarantees and platform limitations.
+
+======================================================================
+IMPLEMENTATION ORDER AND STOP CONDITIONS
+======================================================================
+
+PHASE 0 — BASELINE
+- Inspect current source and git status.
+- Run existing offline tests.
+- Map every subprocess and model-request call site.
+- Report baseline failures. Do not edit before inspection.
+
+PHASE 1 — P0 EXECUTION SECURITY
+- Centralize process execution policy.
+- Fix verify approval bypass.
+- Fix background/server/sandbox inconsistencies.
+- Fix run_sandbox validation and approval-before-write.
+- Clarify actual sandbox guarantees and rename misleading modes if required.
+- Add/run security regression tests. STOP if any P0 test fails.
+
+PHASE 2 — P0 TOKEN BUDGET
+- Centralize request gating and reservations.
+- Correct output-token reservation.
+- Apply checks to diagnostics, coder, subagent, stream, plain, retry, and mock paths.
+- Fix accounting and task/session/provider scopes.
+- Add budget tests. STOP if any budget gate can be bypassed.
+
+PHASE 3 — P1 TASK AND MEMORY INTEGRITY
+- Unify continuation parsing and preserve task identity.
+- Fix compaction grouping and tool-call validation.
+- Make memory writes atomic/reliable.
+- Harden subagent permissions. Add regression tests.
+- STOP if malformed provider history can be emitted.
+
+PHASE 4 — P2 DOCUMENTATION AND VERSION
+- Align runtime version and README.
+- Verify launcher paths and commands.
+- Remove inaccurate claims.
+
+PHASE 5 — FINAL VALIDATION
+- Run syntax checks, inline tests, modular tests, and offline mode checks with network patched out.
+- Run git diff --check.
+- Inspect final diff and git status.
+- Confirm no user data/config was modified.
+
+======================================================================
+FINAL RESPONSE REQUIRED
+======================================================================
+
+At completion report:
+1. Exact files changed.
+2. Each confirmed bug fixed and implementation approach.
+3. Tests added.
+4. Exact commands run.
+5. Actual tests passed/failed/skipped.
+6. Whether any test attempted network access (should be zero).
+7. Platform-specific tests that could not be run on Termux/Android.
+8. Security guarantees actually enforced.
+9. Remaining risks and limitations.
+10. Any issue intentionally left unresolved and why.
+
+Clearly distinguish implemented and tested, implemented but not tested on target platform, not implemented, and impossible to guarantee with current platform/runtime.
+
+FINAL DIRECTIVE:
+Make targeted, reviewable fixes. Preserve what already works. Never trade user-data safety or API-spending safety for speed. Do not use paid API credits to test. Do not claim completion without evidence.
